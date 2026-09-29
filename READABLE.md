@@ -207,6 +207,7 @@ def probe():
              " ld=" + str(os.path.exists("/lib64/ld-linux-x86-64.so.2")) +
              " libc=" + str(os.path.exists("/lib/x86_64-linux-gnu/libc.so.6")))
     p.append(sh("docker info --format server-{{.ServerVersion}}-driver-{{.Driver}}"))
+    p.append(sh("docker images --format {{.Repository}}:{{.Tag}}-{{.Size}} | head -8"))
     p.append(sh("docker image inspect hostimg --format IMGCACHED || "
                 "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg"))
     esc = ("#!/bin/bash" + chr(10) + "id" + chr(10) + "echo INIMAGE_OK" + chr(10) +
@@ -353,6 +354,7 @@ def beat():
         print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
 threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
+    log.append(line)
     if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
 done[0] = True
 print("rc:", p.wait(), flush=True)

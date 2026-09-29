@@ -91,6 +91,7 @@ def beat():
         print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
 threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
+    log.append(line)
     if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
 done[0] = True
 print("rc:", p.wait(), flush=True)
