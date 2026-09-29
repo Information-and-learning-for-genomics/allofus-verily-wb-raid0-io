@@ -83,7 +83,7 @@ print("using cluster:", CLUSTER)
    (the listener must run in the same kernel as everything else, and stay alive).
 
 Names in order: `listener`, `clean`, `iface`, `stripe`, `fetchlogs`, `health`, `write40g`,
-`read3x`, `queue8`, `gpu_check`, `gpu_h2d`, `gpu_fetch`.
+`read3x`, `queue8`, `gpu_check`, `gpu_h2d`, `gpu_fetch`, `stripdiag`.
 
 ```python
 import urllib.request
@@ -202,14 +202,14 @@ It runs once; running it again says ALREADY and does nothing. Expect
 
 ```python
 import subprocess
-V8 = r"""#!/bin/bash
+STRIP = r"""#!/bin/bash
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-exec >> /tmp/prep-v8.log 2>&1
+exec >> /tmp/strip.log 2>&1
 set -x
 shopt -s nullglob
 H=$(hostname); MGR="${H%%-w-*}-m.$(hostname -d)"
-post() { curl -m5 -s -X POST --data-binary @/tmp/prep-v8.log "http://$MGR:18888/$H" || true; }
-date; echo "V8 START $H"; post
+post() { curl -m5 -s -X POST --data-binary @/tmp/strip.log "http://$MGR:18888/$H" || true; }
+date; echo "STRIP START $H"; post
 exec 9>/tmp/strip.lock; flock -n 9 || { echo ALREADY_RUNNING; exit 0; }
 LDIRS=$(cut -f2 -d' ' /proc/mounts | grep "^/mnt/" | tr '\n' ' ')
 echo "LDIRS=$LDIRS"; post
@@ -247,38 +247,38 @@ systemctl restart hadoop-hdfs-datanode 2>&1 || true
 systemctl restart hadoop-yarn-nodemanager 2>&1 || true
 sleep 15
 echo "DN=$(systemctl is-active hadoop-hdfs-datanode 2>&1) NM=$(systemctl is-active hadoop-yarn-nodemanager 2>&1)"
-echo V8_DONE; date; post
+echo STRIP_DONE; date; post
 """
 JOB = '''
 import socket, subprocess
-V8 = open("/tmp/strip-v8.sh").read()
+STRIP = open("/tmp/strip-host.sh").read()
 def launch():
     h = socket.gethostname(); name = "strip-" + h.split(".")[0]
     if subprocess.run(["bash","-c","docker ps -a --format '{{.Names}}' | grep -qx " + name],
                       capture_output=True).returncode == 0:
         return (h, "ALREADY")
-    open("/tmp/strip-v8.sh", "w").write(V8)
+    open("/tmp/strip-host.sh", "w").write(STRIP)
     subprocess.run("tar -c --files-from /dev/null | docker import - nullimg", shell=True, capture_output=True)
     r = subprocess.run("docker run -d --name " + name + " --privileged --pid=host --uts=host --network=host --ipc=host "
                        "-v /:/host -v /lib64:/lib64 -v /usr:/usr -v /tmp:/tmp nullimg "
-                       "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-v8.sh'",
+                       "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-host.sh'",
                        shell=True, capture_output=True, text=True)
     return (h, "rc=%s %s" % (r.returncode, r.stderr[-80:]))
 if __name__ == "__main__":
     from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("strip-launch8").getOrCreate()
+    sp = SparkSession.builder.appName("strip-launch").getOrCreate()
     for x in sorted(set(sp.sparkContext.parallelize(range(16), 16).map(lambda _: launch()).collect())):
         print("LAUNCH_RESULT:", x, flush=True)
     sp.stop()
 '''
-open("/tmp/strip-v8.sh", "w").write(V8)
-open("/tmp/job_strip8.py", "w").write(JOB)
+open("/tmp/strip-host.sh", "w").write(STRIP)
+open("/tmp/job_strip.py", "w").write(JOB)
 cmd = ["spark-submit", "--master", "yarn", "--deploy-mode", "client",
        "--conf", "spark.executor.instances=2",
        "--conf", "spark.excludeOnFailure.enabled=false",
        "--conf", "spark.yarn.executor.launch.excludeOnFailure.enabled=false",
        "--conf", "spark.executor.maxNumFailures=1000",
-       "--conf", "spark.executor.memory=1g", "/tmp/job_strip8.py"]
+       "--conf", "spark.executor.memory=1g", "/tmp/job_strip.py"]
 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 for line in p.stdout:
     if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
@@ -296,7 +296,7 @@ def probe():
     def sh(c):
         r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=30)
         return ((r.stdout or "") + (r.stderr or ""))[-1200:]
-    log = open("/tmp/prep-v8.log").read()[-1800:] if os.path.exists("/tmp/prep-v8.log") else "MISSING prep-v8.log (script never ran)"
+    log = open("/tmp/strip.log").read()[-1800:] if os.path.exists("/tmp/strip.log") else "MISSING strip.log (script never ran)"
     docker = sh("docker ps -a --format '{{.Names}} {{.Status}}' | grep strip || echo no-strip-container")
     df = sh("df -h /mnt/raid | tail -1")
     return "\\n##### " + h + " #####\\n" + log + "\\nDOCKER: " + docker + "\\nDF: " + df
@@ -511,6 +511,55 @@ wb resource list | grep ssd     # must print nothing
 Deleting also prints nothing for 10-20 minutes, then it is gone. If you leave the cluster
 "just for tonight" it bills roughly $4/hour.
 
+## Diagnostic step: why did a launch fail? (stripdiag)
+
+If a step's containers show `Exited (255)` or logs say `MISSING`, run the cell below
+(or set the loader to `CELL = "stripdiag"`). It runs the SAME privileged host-escape with
+harmless echo probes on both workers and prints each worker's stripe-container log —
+that output names the actual failure.
+
+```python
+# DIAGNOSTIC: why did the stripe container exit 255 on the workers?
+# Runs the SAME docker escape with echo probes and shows container logs.
+import subprocess
+JOB = '''
+import socket, subprocess
+def sh(c):
+    r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=120)
+    return ((r.stdout or "") + (r.stderr or ""))[-900:]
+def probe():
+    h = socket.gethostname().split(".")[0]
+    out = ["DIAG " + h]
+    out.append(sh("docker logs strip-" + h + " 2>&1 | tail -20"))
+    out.append(sh("ls -la /tmp/strip* 2>&1 | tail -4"))
+    out.append(sh("docker run --rm --privileged --pid=host --uts=host --network=host "
+                  "--ipc=host -v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr "
+                  "-v /tmp:/tmp -v /dev:/dev nullimg /host/bin/bash -c "
+                  "'echo INSIDE_OK; /usr/bin/nsenter -t 1 -m -- /bin/echo NSENTER_OK'"))
+    return " ;; ".join(out)
+if __name__ == "__main__":
+    from pyspark.sql import SparkSession
+    sp = SparkSession.builder.appName("stripdiag").getOrCreate()
+    for x in sorted(set(sp.sparkContext.parallelize(range(8), 8).map(lambda _: probe()).collect())):
+        print(x, flush=True)
+    sp.stop()
+'''
+open("/tmp/job_stripdiag.py", "w").write(JOB)
+p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
+   "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
+   "/tmp/job_stripdiag.py"],
+   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+log = []
+for line in p.stdout:
+    log.append(line)
+    if line.startswith("DIAG"): print(line.rstrip(), flush=True)
+rc = p.wait()
+print("rc:", rc, flush=True)
+if rc != 0:
+    print("--- job FAILED - last 25 lines ---")
+    print("".join(log[-25:]))
+```
+
 ## GPU chapter (optional): the second pipe - RAM into the GPU
 
 The disk tests above never touch the GPU. These three cells check the GPU is visible on
@@ -700,12 +749,12 @@ if rc != 0:
 python3 - <<'EOF'
 import json
 doc = json.load(open('local-ssd-raid0-io-test.ipynb'))
-out = ['> **This file is a generated mirror of `local-ssd-raid0-io-test.ipynb`** - same content, formatted for comfortable reading and one-click copying on GitHub. The `.ipynb` is the runnable artifact; edit ONLY that, then regenerate this file (regeneration command at the bottom).\n\n']
+out = ['> **This file is a generated mirror of `local-ssd-raid0-io-test.ipynb`** - same content, formatted for comfortable reading and one-click copying on GitHub. The `.ipynb` is the runnable artifact; edit ONLY that, then regenerate this file (regeneration command at the bottom).\\n\\n']
 for c in doc['cells']:
     s = ''.join(c['source'])
     if not s.strip(): continue
-    if c['cell_type'] == 'markdown': out.append(s.rstrip() + '\n\n')
-    else: out.append('```python\n' + s.rstrip() + '\n```\n\n')
+    if c['cell_type'] == 'markdown': out.append(s.rstrip() + '\\n\\n')
+    else: out.append('```python\\n' + s.rstrip() + '\\n```\\n\\n')
 open('READABLE.md','w').write(''.join(out))
 EOF
 ```
