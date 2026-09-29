@@ -6,7 +6,7 @@ def probe():
     def sh(c):
         r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=30)
         return ((r.stdout or "") + (r.stderr or ""))[-1200:]
-    log = open("/tmp/prep-v8.log").read()[-1800:] if os.path.exists("/tmp/prep-v8.log") else "MISSING prep-v8.log (script never ran)"
+    log = open("/tmp/strip.log").read()[-1800:] if os.path.exists("/tmp/strip.log") else "MISSING strip.log (script never ran)"
     docker = sh("docker ps -a --format '{{.Names}} {{.Status}}' | grep strip || echo no-strip-container")
     df = sh("df -h /mnt/raid | tail -1")
     return "\\n##### " + h + " #####\\n" + log + "\\nDOCKER: " + docker + "\\nDF: " + df

@@ -1,12 +1,12 @@
 import subprocess
-V8 = r"""#!/bin/bash
+STRIP = r"""#!/bin/bash
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-exec >> /tmp/prep-v8.log 2>&1
+exec >> /tmp/strip.log 2>&1
 set -x
 shopt -s nullglob
 H=$(hostname); MGR="${H%%-w-*}-m.$(hostname -d)"
-post() { curl -m5 -s -X POST --data-binary @/tmp/prep-v8.log "http://$MGR:18888/$H" || true; }
-date; echo "V8 START $H"; post
+post() { curl -m5 -s -X POST --data-binary @/tmp/strip.log "http://$MGR:18888/$H" || true; }
+date; echo "STRIP START $H"; post
 exec 9>/tmp/strip.lock; flock -n 9 || { echo ALREADY_RUNNING; exit 0; }
 LDIRS=$(cut -f2 -d' ' /proc/mounts | grep "^/mnt/" | tr '\n' ' ')
 echo "LDIRS=$LDIRS"; post
@@ -44,38 +44,38 @@ systemctl restart hadoop-hdfs-datanode 2>&1 || true
 systemctl restart hadoop-yarn-nodemanager 2>&1 || true
 sleep 15
 echo "DN=$(systemctl is-active hadoop-hdfs-datanode 2>&1) NM=$(systemctl is-active hadoop-yarn-nodemanager 2>&1)"
-echo V8_DONE; date; post
+echo STRIP_DONE; date; post
 """
 JOB = '''
 import socket, subprocess
-V8 = open("/tmp/strip-v8.sh").read()
+STRIP = open("/tmp/strip-host.sh").read()
 def launch():
     h = socket.gethostname(); name = "strip-" + h.split(".")[0]
     if subprocess.run(["bash","-c","docker ps -a --format '{{.Names}}' | grep -qx " + name],
                       capture_output=True).returncode == 0:
         return (h, "ALREADY")
-    open("/tmp/strip-v8.sh", "w").write(V8)
+    open("/tmp/strip-host.sh", "w").write(STRIP)
     subprocess.run("tar -c --files-from /dev/null | docker import - nullimg", shell=True, capture_output=True)
     r = subprocess.run("docker run -d --name " + name + " --privileged --pid=host --uts=host --network=host --ipc=host "
                        "-v /:/host -v /lib64:/lib64 -v /usr:/usr -v /tmp:/tmp nullimg "
-                       "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-v8.sh'",
+                       "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-host.sh'",
                        shell=True, capture_output=True, text=True)
     return (h, "rc=%s %s" % (r.returncode, r.stderr[-80:]))
 if __name__ == "__main__":
     from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("strip-launch8").getOrCreate()
+    sp = SparkSession.builder.appName("strip-launch").getOrCreate()
     for x in sorted(set(sp.sparkContext.parallelize(range(16), 16).map(lambda _: launch()).collect())):
         print("LAUNCH_RESULT:", x, flush=True)
     sp.stop()
 '''
-open("/tmp/strip-v8.sh", "w").write(V8)
-open("/tmp/job_strip8.py", "w").write(JOB)
+open("/tmp/strip-host.sh", "w").write(STRIP)
+open("/tmp/job_strip.py", "w").write(JOB)
 cmd = ["spark-submit", "--master", "yarn", "--deploy-mode", "client",
        "--conf", "spark.executor.instances=2",
        "--conf", "spark.excludeOnFailure.enabled=false",
        "--conf", "spark.yarn.executor.launch.excludeOnFailure.enabled=false",
        "--conf", "spark.executor.maxNumFailures=1000",
-       "--conf", "spark.executor.memory=1g", "/tmp/job_strip8.py"]
+       "--conf", "spark.executor.memory=1g", "/tmp/job_strip.py"]
 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 for line in p.stdout:
     if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
