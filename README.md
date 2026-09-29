@@ -22,6 +22,5 @@ The official disk speed caps come from Google's own table:
 https://docs.cloud.google.com/compute/docs/disks/local-ssd#ssd-perf-disk-count
 ("SCSI Local SSD performance" / "NVMe Local SSD performance" sections).
 
-Cost: the whole recipe (2 workers + 16 local SSDs each) is about $4/hour, so one full
-run - create, benchmark, delete - is roughly $4. Delete the cluster when done
-(last step of the notebook).
+Cost: the whole recipe (2 workers with 16 local SSDs each) is about **$4/hour**.
+Delete the cluster when done (last step of the notebook).
