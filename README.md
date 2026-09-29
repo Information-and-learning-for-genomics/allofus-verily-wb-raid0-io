@@ -10,6 +10,8 @@ What we order and what we do, step by step (all commands and code are in
   notebook — one cell, runs once
 - the notebook then measures the real speed with cold direct-IO tests (write 40 GiB, read
   it back once, then with 8 readers at once)
+- optional GPU chapter: checks the GPU on the workers and measures RAM -> GPU copy speed
+  (~8-11 GiB/s on a T4, so the GPU road is wider than the disk - the disk is the bottleneck)
 - and finally: delete the cluster (it is real money)
 
 The speed caps we measure come straight from Google's own table:
