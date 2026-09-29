@@ -258,9 +258,11 @@ def launch():
                       capture_output=True).returncode == 0:
         return (h, "ALREADY")
     open("/tmp/strip-host.sh", "w").write(STRIP)
-    subprocess.run("tar -c --files-from /dev/null | docker import - nullimg", shell=True, capture_output=True)
+    subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
+                       "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
+               shell=True, capture_output=True, timeout=600)
     r = subprocess.run("docker run -d --name " + name + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /usr:/usr -v /tmp:/tmp nullimg "
+                       "-v /:/host -v /lib64:/lib64 -v /usr:/usr -v /tmp:/tmp hostimg "
                        "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-host.sh'",
                        shell=True, capture_output=True, text=True)
     return (h, "rc=%s %s" % (r.returncode, r.stderr[-80:]))
@@ -354,7 +356,7 @@ def launch():
     h = socket.gethostname().split(".")[0]
     open("/tmp/w.sh", "w").write(FR)
     r = subprocess.run("docker run -d --name w-" + SUFFIX + "-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp nullimg "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp hostimg "
                        "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/w.sh'",
                        shell=True, capture_output=True, text=True)
     return "WOK " + h + " rc=" + str(r.returncode)
@@ -477,7 +479,7 @@ def launch():
     h = socket.gethostname().split(".")[0]
     open("/tmp/r2.sh", "w").write(FR)
     r = subprocess.run("docker run -d --name r2-" + SUFFIX + "-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp nullimg "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp hostimg "
                        "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/r2.sh'",
                        shell=True, capture_output=True, text=True)
     return "R2OK " + h + " rc=" + str(r.returncode)
@@ -527,14 +529,19 @@ import socket, subprocess
 def sh(c):
     r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=120)
     return ((r.stdout or "") + (r.stderr or ""))[-900:]
+def ensure_img():
+    subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
+                   "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
+                   shell=True, capture_output=True, timeout=600)
 def probe():
+    ensure_img()
     h = socket.gethostname().split(".")[0]
     out = ["DIAG " + h]
     out.append(sh("docker logs strip-" + h + " 2>&1 | tail -20"))
     out.append(sh("ls -la /tmp/strip* 2>&1 | tail -4"))
     out.append(sh("docker run --rm --privileged --pid=host --uts=host --network=host "
                   "--ipc=host -v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr "
-                  "-v /tmp:/tmp -v /dev:/dev nullimg /host/bin/bash -c "
+                  "-v /tmp:/tmp -v /dev:/dev hostimg /bin/bash -c "
                   "'echo INSIDE_OK; /usr/bin/nsenter -t 1 -m -- /bin/echo NSENTER_OK'"))
     return " ;; ".join(out)
 if __name__ == "__main__":
@@ -579,10 +586,15 @@ then GPU-2, then GPU-3 after the H2_DONE heartbeats appear in the listener cell.
 import subprocess
 JOB = '''
 import socket, subprocess
+def ensure_img():
+    subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
+                   "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
+                   shell=True, capture_output=True, timeout=600)
 def probe():
+    ensure_img()
     h = socket.gethostname().split(".")[0]
     cmd = ("docker run --rm --privileged --pid=host --uts=host --network=host --ipc=host "
-           "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev nullimg "
+           "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev hostimg "
            "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv'")
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
     return "GPU " + h + " rc=" + str(r.returncode) + " | " + ((r.stdout or "") + (r.stderr or ""))[-300:]
@@ -657,7 +669,7 @@ def launch():
     open("/tmp/h2dTOK.sh", "w").write(FR)
     open("/tmp/h2d_progTOK.py", "w").write(PG)
     r = subprocess.run("docker run -d --name h2-TOK-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev nullimg "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev hostimg "
                        "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/h2dTOK.sh'",
                        shell=True, capture_output=True, text=True)
     return "H2START " + h + " rc=" + str(r.returncode)
@@ -741,20 +753,3 @@ if rc != 0:
   24 disks per worker (9,360 MiB/s row) instead of 16 barely changes the bill.
   Speed caps: https://docs.cloud.google.com/compute/docs/disks/local-ssd#ssd-perf-disk-count
 
----
-
-### Regenerating this mirror (run in repo checkout)
-
-```bash
-python3 - <<'EOF'
-import json
-doc = json.load(open('local-ssd-raid0-io-test.ipynb'))
-out = ['> **This file is a generated mirror of `local-ssd-raid0-io-test.ipynb`** - same content, formatted for comfortable reading and one-click copying on GitHub. The `.ipynb` is the runnable artifact; edit ONLY that, then regenerate this file (regeneration command at the bottom).\\n\\n']
-for c in doc['cells']:
-    s = ''.join(c['source'])
-    if not s.strip(): continue
-    if c['cell_type'] == 'markdown': out.append(s.rstrip() + '\\n\\n')
-    else: out.append('```python\\n' + s.rstrip() + '\\n```\\n\\n')
-open('READABLE.md','w').write(''.join(out))
-EOF
-```

@@ -26,7 +26,7 @@ def launch():
     h = socket.gethostname().split(".")[0]
     open("/tmp/r.sh", "w").write(FR)
     r = subprocess.run("docker run -d --name r-" + SUFFIX + "-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp nullimg "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp hostimg "
                        "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/r.sh'",
                        shell=True, capture_output=True, text=True)
     return "ROK " + h + " rc=" + str(r.returncode)

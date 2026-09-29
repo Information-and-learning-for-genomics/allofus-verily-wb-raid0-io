@@ -4,10 +4,15 @@
 import subprocess
 JOB = '''
 import socket, subprocess
+def ensure_img():
+    subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
+                   "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
+                   shell=True, capture_output=True, timeout=600)
 def probe():
+    ensure_img()
     h = socket.gethostname().split(".")[0]
     cmd = ("docker run --rm --privileged --pid=host --uts=host --network=host --ipc=host "
-           "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev nullimg "
+           "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev hostimg "
            "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv'")
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
     return "GPU " + h + " rc=" + str(r.returncode) + " | " + ((r.stdout or "") + (r.stderr or ""))[-300:]

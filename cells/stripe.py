@@ -55,9 +55,11 @@ def launch():
                       capture_output=True).returncode == 0:
         return (h, "ALREADY")
     open("/tmp/strip-host.sh", "w").write(STRIP)
-    subprocess.run("tar -c --files-from /dev/null | docker import - nullimg", shell=True, capture_output=True)
+    subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
+                       "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
+               shell=True, capture_output=True, timeout=600)
     r = subprocess.run("docker run -d --name " + name + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /usr:/usr -v /tmp:/tmp nullimg "
+                       "-v /:/host -v /lib64:/lib64 -v /usr:/usr -v /tmp:/tmp hostimg "
                        "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-host.sh'",
                        shell=True, capture_output=True, text=True)
     return (h, "rc=%s %s" % (r.returncode, r.stderr[-80:]))
