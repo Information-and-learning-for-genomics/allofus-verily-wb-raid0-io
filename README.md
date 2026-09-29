@@ -18,6 +18,11 @@ The speed caps we measure come straight from Google's own table:
 attaches the disks as SCSI (the NVMe option is dropped by Terra's Workspace Manager; we
 filed the fix upstream).
 
+Network limits (only relevant for downloading data ONTO the machine - the local disk
+numbers above never touch the network): https://cloud.google.com/compute/docs/gpus/gpu-network-bandwidth
+For N1 with 1 GPU the network cap is min(2 Gbps x vCPUs, 32 Gbps) = at most 3.7 GiB/s,
+reached already at 16 vCPUs (more CPUs do not add network, and do not change disk speed).
+
 Cost: the whole recipe (2 workers with 16 local SSDs each) is about $4/hour, which would be
 an equivalent of $2/h per worker/experiment. Delete the cluster when done (last step of the
 notebook).
