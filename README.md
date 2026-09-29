@@ -18,5 +18,10 @@ us-central1, September 2026):
 | read 40 GiB, one big-block reader | ~3.5 GiB/s steady |
 | read 40 GiB, 8 readers at once | ~6 GiB/s (the official 16-disk SCSI cap) |
 
-Cost: about $5/hour for the two-worker test cluster, ~$5 for one full run including
-create and delete. Delete the cluster when done (last step of the notebook).
+The official disk speed caps come from Google's own table:
+https://docs.cloud.google.com/compute/docs/disks/local-ssd#ssd-perf-disk-count
+("SCSI Local SSD performance" / "NVMe Local SSD performance" sections).
+
+Cost: the whole recipe (2 workers + 16 local SSDs each) is about $4/hour, so one full
+run - create, benchmark, delete - is roughly $4. Delete the cluster when done
+(last step of the notebook).
