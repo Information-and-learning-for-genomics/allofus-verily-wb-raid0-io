@@ -1,5 +1,10 @@
 # A recipe to get the highest disk io throughput in Research All of Us Verily Workbench
 
+> **Reading or copying this on GitHub? Open [READABLE.md](READABLE.md)** - identical content,
+> rendered as normal documentation with proper copy buttons on every code block
+> (GitHub's built-in notebook viewer truncates long cells and copies badly).
+> [local-ssd-raid0-io-test.ipynb](local-ssd-raid0-io-test.ipynb) is the file you run.
+
 What we order and what we do, step by step (all commands and code are in
 [`local-ssd-raid0-io-test.ipynb`](local-ssd-raid0-io-test.ipynb), run top to bottom):
 
