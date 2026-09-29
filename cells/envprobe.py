@@ -12,6 +12,7 @@ def probe():
              " ld=" + str(os.path.exists("/lib64/ld-linux-x86-64.so.2")) +
              " libc=" + str(os.path.exists("/lib/x86_64-linux-gnu/libc.so.6")))
     p.append(sh("docker info --format server-{{.ServerVersion}}-driver-{{.Driver}}"))
+    p.append(sh("docker images --format {{.Repository}}:{{.Tag}}-{{.Size}} | head -8"))
     p.append(sh("docker image inspect hostimg --format IMGCACHED || "
                 "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg"))
     esc = ("#!/bin/bash" + chr(10) + "id" + chr(10) + "echo INIMAGE_OK" + chr(10) +
