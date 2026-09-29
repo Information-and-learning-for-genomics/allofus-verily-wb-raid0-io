@@ -1,6 +1,6 @@
 # DIAGNOSTIC: why did the stripe container exit 255 on the workers?
 # Runs the SAME docker escape with echo probes and shows container logs.
-import subprocess
+import subprocess, threading, time
 JOB = '''
 import socket, subprocess
 def sh(c):
@@ -34,9 +34,17 @@ p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "clie
    "/tmp/job_stripdiag.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     log.append(line)
     if line.startswith("DIAG"): print(line.rstrip(), flush=True)
+done[0] = True
 rc = p.wait()
 print("rc:", rc, flush=True)
 if rc != 0:

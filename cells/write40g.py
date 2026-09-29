@@ -40,6 +40,15 @@ env = dict(os.environ, SFX="%04x" % random.randrange(65536))
 p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
    "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_w.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     if line.startswith("WLAUNCH:"): print(line.rstrip()[:120], flush=True)
+done[0] = True
 p.wait(); print("watch LISTENER cell for W_DONE x2", flush=True)

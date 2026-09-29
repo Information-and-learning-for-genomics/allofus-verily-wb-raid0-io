@@ -193,7 +193,7 @@ if rc != 0:
 Verifies on every worker, in 1-2 minutes, everything the privileged steps assume: OS, docker server, that `hostimg` can be built, and the full escape end-to-end. Green line = `uid=0(root)` twice, `INIMAGE_OK`, `NSENTER_OK`, disk count, `active`. If this passes, every step below works on this machine - no guessing.
 
 ```python
-import subprocess
+import subprocess, threading, time
 JOB = '''
 import os, socket, subprocess
 def sh(c):
@@ -230,9 +230,17 @@ p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "clie
    "/tmp/job_envprobe.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     log.append(line)
     if line.startswith("ENVPROBE"): print(line.rstrip(), flush=True)
+done[0] = True
 rc = p.wait()
 print("rc:", rc, flush=True)
 if rc != 0:
@@ -252,7 +260,7 @@ It runs once; running it again says ALREADY and does nothing. Expect
 `LAUNCH_RESULT ... rc=0` for both workers, then look at step 8.
 
 ```python
-import subprocess
+import subprocess, threading, time
 STRIP = r"""#!/bin/bash
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 exec >> /tmp/strip.log 2>&1
@@ -336,15 +344,24 @@ cmd = ["spark-submit", "--master", "yarn", "--deploy-mode", "client",
        "--conf", "spark.executor.maxNumFailures=1000",
        "--conf", "spark.executor.memory=1g", "/tmp/job_strip.py"]
 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
+done[0] = True
 print("rc:", p.wait(), flush=True)
 ```
 
 ## Step 8 - Check that the stripe is healthy
 
 ```python
-import subprocess
+import subprocess, threading, time
 JOB = '''
 import socket, subprocess, os
 def probe():
@@ -368,8 +385,17 @@ p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "clie
                       "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
                       "/tmp/job_fetch.py"],
                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
+done[0] = True
 print("rc:", p.wait(), flush=True)
 ```
 
@@ -429,8 +455,17 @@ env = dict(os.environ, SFX="%04x" % random.randrange(65536))
 p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
    "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_w.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     if line.startswith("WLAUNCH:"): print(line.rstrip()[:120], flush=True)
+done[0] = True
 p.wait(); print("watch LISTENER cell for W_DONE x2", flush=True)
 ```
 
@@ -488,8 +523,17 @@ env = dict(os.environ, SFX="%04x" % random.randrange(65536))
 p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
    "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_r.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     if line.startswith("RLAUNCH:"): print(line.rstrip()[:120], flush=True)
+done[0] = True
 p.wait(); print("watch LISTENER cell for R_ALLDONE x2", flush=True)
 ```
 
@@ -552,8 +596,17 @@ env = dict(os.environ, SFX="%04x" % random.randrange(65536))
 p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
    "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_r2.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     if line.startswith("R2LAUNCH:"): print(line.rstrip()[:120], flush=True)
+done[0] = True
 p.wait(); print("watch LISTENER cell for R2_DONE x2", flush=True)
 ```
 
@@ -577,7 +630,7 @@ that output names the actual failure.
 ```python
 # DIAGNOSTIC: why did the stripe container exit 255 on the workers?
 # Runs the SAME docker escape with echo probes and shows container logs.
-import subprocess
+import subprocess, threading, time
 JOB = '''
 import socket, subprocess
 def sh(c):
@@ -611,9 +664,17 @@ p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "clie
    "/tmp/job_stripdiag.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     log.append(line)
     if line.startswith("DIAG"): print(line.rstrip(), flush=True)
+done[0] = True
 rc = p.wait()
 print("rc:", rc, flush=True)
 if rc != 0:
@@ -637,7 +698,7 @@ then GPU-2, then GPU-3 after the H2_DONE heartbeats appear in the listener cell.
 # GPU-1: is the GPU visible and healthy on every worker? Output comes back into this
 # cell. If only one worker appears, just re-run (YARN may stack both executors on one
 # worker; a few re-runs reach both).
-import subprocess
+import subprocess, threading, time
 JOB = '''
 import socket, subprocess
 def ensure_img():
@@ -664,9 +725,17 @@ p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
    "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_gpu.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     log.append(line)
     if line.startswith("GPUCHECK:"): print(line.rstrip()[:250], flush=True)
+done[0] = True
 rc = p.wait()
 print("rc:", rc, flush=True)
 if rc != 0:
@@ -739,9 +808,17 @@ p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
    "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_h2d.py"],
    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     log.append(line)
     if line.startswith("H2LAUNCH:"): print(line.rstrip()[:160], flush=True)
+done[0] = True
 rc = p.wait()
 print("rc:", rc, " SFX:", SFX, flush=True)
 if rc != 0:

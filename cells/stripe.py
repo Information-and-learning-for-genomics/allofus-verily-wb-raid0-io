@@ -1,4 +1,4 @@
-import subprocess
+import subprocess, threading, time
 STRIP = r"""#!/bin/bash
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 exec >> /tmp/strip.log 2>&1
@@ -82,6 +82,15 @@ cmd = ["spark-submit", "--master", "yarn", "--deploy-mode", "client",
        "--conf", "spark.executor.maxNumFailures=1000",
        "--conf", "spark.executor.memory=1g", "/tmp/job_strip.py"]
 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+log = []
+done = [False]
+def beat():
+    t0 = time.time()
+    while not done[0]:
+        time.sleep(10)
+        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
+threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
     if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
+done[0] = True
 print("rc:", p.wait(), flush=True)
