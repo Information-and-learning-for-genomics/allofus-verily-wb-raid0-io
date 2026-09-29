@@ -22,7 +22,7 @@ def launch():
     open("/tmp/w.sh", "w").write(FR)
     r = subprocess.run("docker run -d --name w-" + SUFFIX + "-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
                        "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp hostimg "
-                       "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/w.sh'",
+                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/w.sh'",
                        shell=True, capture_output=True, text=True)
     return "WOK " + h + " rc=" + str(r.returncode)
 if __name__ == "__main__":

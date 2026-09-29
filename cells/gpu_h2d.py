@@ -47,7 +47,7 @@ def launch():
     open("/tmp/h2d_progTOK.py", "w").write(PG)
     r = subprocess.run("docker run -d --name h2-TOK-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
                        "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev hostimg "
-                       "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/h2dTOK.sh'",
+                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/h2dTOK.sh'",
                        shell=True, capture_output=True, text=True)
     return "H2START " + h + " rc=" + str(r.returncode)
 if __name__ == "__main__":

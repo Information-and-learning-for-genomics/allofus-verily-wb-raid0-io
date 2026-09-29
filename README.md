@@ -42,3 +42,23 @@ What this recipe achieves per worker (measured, us-central1, September 2026):
 | write 40 GiB (O_DIRECT) | ~3 GiB/s |
 | read 40 GiB, one big-block reader | ~3.5 GiB/s steady |
 | read 40 GiB, 8 readers at once | ~6 GiB/s (the official 16-disk SCSI cap) |
+
+## Privileged-exec recipe (works on ANY Dataproc image, GPU or not)
+
+Dataproc gives you no root and passwordless `sudo` is off, so root-level steps (mdadm, mounts,
+GPU probes) run from a YARN task via a container escape. The old trick - `docker run` an EMPTY
+imported image and exec the host's `/bin/bash` through a bind-mount of `/` - broke silently when
+Google moved the OS image layout (`exec /host/bin/bash: no such file or directory`, exit 255).
+The robust recipe, invariant across images:
+
+1. **Never exec host binaries from an empty image.** Build a real image from the host's own system
+   dirs once per worker: `tar -c -C / bin lib lib64 usr | docker import - hostimg` (~1-2 min,
+   ~1-3 GB on the boot disk, cached afterwards, dies with the cluster).
+2. **Escape = `docker run --privileged --pid=host -v /:/host -v /tmp:/tmp hostimg /bin/bash ...`
+   then `nsenter -t 1 -m`** to run in the host mount namespace. Script is handed over via shared
+   `/tmp`. Container exits after the script; nothing persists as a process.
+3. **Run `envprobe` (Step 0) on any new cluster first** - it checks OS, docker server, builds
+   hostimg, and smoke-tests the full escape (uid=0 x2 + INIMAGE_OK + NSENTER_OK) before you
+   commit to long steps.
+4. Guards self-heal: a dead `strip-*` container from a previous attempt is auto-removed; a
+   running one is reported `ALREADY_RUNNING` and left alone.

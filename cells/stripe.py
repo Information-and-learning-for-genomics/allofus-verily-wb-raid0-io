@@ -51,16 +51,19 @@ import socket, subprocess
 STRIP = open("/tmp/strip-host.sh").read()
 def launch():
     h = socket.gethostname(); name = "strip-" + h.split(".")[0]
-    if subprocess.run(["bash","-c","docker ps -a --format '{{.Names}}' | grep -qx " + name],
-                      capture_output=True).returncode == 0:
-        return (h, "ALREADY")
+    st = subprocess.run("docker inspect -f '{{.State.Running}}' " + name + " 2>/dev/null || echo none",
+                        shell=True, capture_output=True, text=True).stdout.strip()
+    if st == "True":
+        return (h, "ALREADY_RUNNING")
+    if st != "none":
+        subprocess.run("docker rm -f " + name + " 2>/dev/null; true", shell=True, capture_output=True)
     open("/tmp/strip-host.sh", "w").write(STRIP)
     subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
                        "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
                shell=True, capture_output=True, timeout=600)
     r = subprocess.run("docker run -d --name " + name + " --privileged --pid=host --uts=host --network=host --ipc=host "
                        "-v /:/host -v /lib64:/lib64 -v /usr:/usr -v /tmp:/tmp hostimg "
-                       "/host/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-host.sh'",
+                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-host.sh'",
                        shell=True, capture_output=True, text=True)
     return (h, "rc=%s %s" % (r.returncode, r.stderr[-80:]))
 if __name__ == "__main__":
