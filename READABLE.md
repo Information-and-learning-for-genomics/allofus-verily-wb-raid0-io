@@ -310,29 +310,49 @@ echo "DN=$(systemctl is-active hadoop-hdfs-datanode 2>&1) NM=$(systemctl is-acti
 echo STRIP_DONE; date; post
 """
 JOB = '''
-import socket, subprocess
-STRIP = open("/tmp/strip-host.sh").read()
+import socket, subprocess, urllib.request, time
+STRIP = open("strip-host.sh").read()
+def mgr():
+    fq = socket.getfqdn()
+    return socket.gethostname().split("-w-")[0] + "-m." + ".".join(fq.split(".")[1:])
+def post(h, msg):
+    try:
+        urllib.request.urlopen("http://" + mgr() + ":18888/step-" + h,
+                               (msg + chr(10)).encode(), timeout=5)
+    except Exception:
+        pass
 def launch():
     h = socket.gethostname(); name = "strip-" + h.split(".")[0]
+    post(h, "GUARD checking container " + name)
     st = subprocess.run("docker inspect -f '{{.State.Running}}' " + name + " 2>/dev/null || echo none",
                         shell=True, capture_output=True, text=True).stdout.strip()
     if st == "True":
-        return (h, "ALREADY_RUNNING")
+        post(h, "GUARD already running -> skip"); return (h, "ALREADY_RUNNING")
     if st != "none":
-        subprocess.run("docker rm -f " + name + " 2>/dev/null; true", shell=True, capture_output=True)
+        post(h, "GUARD removing dead container"); subprocess.run("docker rm -f " + name + " 2>/dev/null; true", shell=True, capture_output=True)
     open("/tmp/strip-host.sh", "w").write(STRIP)
-    subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
-                       "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
-               shell=True, capture_output=True, timeout=600)
+    t0 = time.time()
+    r = subprocess.run("docker image inspect hostimg >/dev/null 2>&1 && echo CACHED || echo MISSING",
+                       shell=True, capture_output=True, text=True).stdout.strip()
+    if r != "CACHED":
+        post(h, "HOSTIMG missing: tar of /bin /lib /lib64 /usr started")
+        t1 = time.time()
+        r2 = subprocess.run("tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
+                            shell=True, capture_output=True, text=True, timeout=900)
+        post(h, "HOSTIMG import done in %ds rc=%s out=%s" % (time.time()-t1, r2.returncode, (r2.stdout or r2.stderr)[-80:]))
+    else:
+        post(h, "HOSTIMG cached")
     r = subprocess.run("docker run -d --name " + name + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /usr:/usr -v /tmp:/tmp hostimg "
+                       "-v /:/host -v /tmp:/tmp hostimg "
                        "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-host.sh'",
                        shell=True, capture_output=True, text=True)
-    return (h, "rc=%s %s" % (r.returncode, r.stderr[-80:]))
+    post(h, "DOCKER_RUN rc=%s out=%s err=%s" % (r.returncode, (r.stdout or "")[-30:], (r.stderr or "")[-120:]))
+    post(h, "TOTAL launch %ds" % (time.time()-t0))
+    return (h, "rc=%s %s" % (r.returncode, (r.stderr or r.stdout)[-80:]))
 if __name__ == "__main__":
     from pyspark.sql import SparkSession
     sp = SparkSession.builder.appName("strip-launch").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(16), 16).map(lambda _: launch()).collect())):
+    for x in sorted(set(sp.sparkContext.parallelize(range(2), 2).map(lambda _: launch()).collect())):
         print("LAUNCH_RESULT:", x, flush=True)
     sp.stop()
 '''
@@ -343,6 +363,7 @@ cmd = ["spark-submit", "--master", "yarn", "--deploy-mode", "client",
        "--conf", "spark.excludeOnFailure.enabled=false",
        "--conf", "spark.yarn.executor.launch.excludeOnFailure.enabled=false",
        "--conf", "spark.executor.maxNumFailures=1000",
+       "--files", "/tmp/strip-host.sh",
        "--conf", "spark.executor.memory=1g", "/tmp/job_strip.py"]
 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 log = []
