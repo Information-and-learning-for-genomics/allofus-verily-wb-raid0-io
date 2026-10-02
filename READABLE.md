@@ -1,909 +1,674 @@
-> **This file is a generated mirror of `local-ssd-raid0-io-test.ipynb`** - same content, formatted for comfortable reading and one-click copying on GitHub. The `.ipynb` is the runnable artifact; edit ONLY that, then regenerate this file (regeneration command at the bottom).
+# REPRODUCE.md — storage→GPU RAID0 bench on Verily Workbench Dataproc (top-down, replayable)
 
-# Local SSD RAID0 speed test on Verily Workbench Dataproc
+Date: 2026-10-02 (v3.2: empty-image+loader-mount launch, dual-mode cells, pinned session,
+quiescence audit). Order a cluster with the command in README; C4 probe is the hardware truth (the tenant
+may silently template GPU workers to n1-standard-8+8SSD — README explains); proxyUri per cluster via
+`wb resource describe --id=<cluster> --format=JSON`).
+Question: does the cheap box reproduce the per-box 6.1–6.7 GiB/s 16-disk row WITH the GPU in the path?
+Refs (raw GiB/s only): dd QD1-4M 3.4, QD8 6.1–6.7 per box (RESULTS.md §38–39); T4 pinned H2D 11.4
+(RESULTS.md:108). JupyterLab (Python 3 kernel, keep it alive during a run) — proxyUri from
+`wb resource describe --id=t4-io3`.
 
-What this notebook does, in one sentence: it makes a Dataproc cluster, glues its local SSDs
-into one fast volume (RAID0), and measures how fast you can really write and read it.
+## Freshness contract (read before pasting ANYTHING)
+- **A kernel restart alone does NOT clean the workers**: executors, YARN apps, docker containers,
+  and bench processes SURVIVE it (only the kernel's listener + SparkSession die). Therefore after
+  THE ONLY execution model: **kernel fresh (or brand-new cluster) → run the file TOP DOWN, once:
+  C0 → C1 → C2 → C3 → C4 → … → C8.** Individual cells are NEVER re-run. The ONLY recovery from any
+  failure, hang, weird marker or kernel restart: **restart the kernel and run the file again from
+  C0** — every cell is idempotent (stripe skips if mounted, fill skips if size exact, per-run
+  random SFX makes worker tasks fresh each pass), so top-down replay always lands in a clean
+  state — exactly the state a person running from scratch sees.
+- Any cell printing `PREFLIGHT FAIL` (sink dead) or `MODE: spark-submit fallback` AFTER you ran
+  C2 means the contract was broken → restart kernel, run the file from C0.
+- The sink (C1) prints every worker POST tail; every generated cell refuses to run at all unless
+  the sink provably answers. Markers must arrive from BOTH workers (×2).
 
-What we measured (so you know what to expect):
+## Marker table (the per-cell GREEN definition)
+| Cell | What | GREEN marker(s) |
+|------|------|-----------------|
+| C0 | clean YARN (RAW) | `KILLED <app id>` per orphan app (no output = nothing to kill) |
+| C1 | sink (RAW, self-test) | `SINK OK` |
+| C2 | pinned session (RAW/pyspark-in-kernel) | `SESSION OK` + applicationId + `hosts=` with ≥2 hosts |
+| C3 | quiescence audit (uses session) | `QFRESH_PASS <n>` ×2 (body ends with it; `QFRESH_FAIL …` → restart kernel, run from C0) |
+| C4 | probe | `T4PROBE_DONE` ×2 with CPU_RAM/GCE_MT/SSD_DATA/PCI_GPU/NVIDIA_SMI |
+| C5 | setup/stripe 16 disks | `T4SETUP_DONE` ×2 |
+| C6 | fill 40 GiB (repo contract: /mnt/raid/benchfile = 40 GiB) | `FILL_ALLDONE` ×2 |
+| C7 | THE BENCH L0–L3 | `T4BENCH_DONE` ×2 + `RESULT_JSON` per leg |
+| C8 | fetch | per-host log/JSON tails, `rc: 0` |
 
-| what | speed (per worker) |
-|---|---|
-| default GCS bucket download | ~0.14 GiB/s |
-| 4 local SSDs, plain read | ~1.4 GiB/s |
-| 16 local SSDs, big block read | ~3.5 GiB/s |
-| 16 local SSDs, 8 reads at once | ~6 GiB/s (the official SCSI maximum) |
+## Operating rules
+- **Copy from THIS file only** — never retype/re-render through the chat UI ($-backslash corruption).
+- Benign: `rc=125` "name in use" (dup task on same executor; the per-run-SFX flock dedupes).
+- One host only after a cell: C2 self-heals single-host sessions inside its own run; if a later
+  cell still reports one host → restart kernel, run the file from C0.
+- C6 fill: 40 GiB ≈ 13–20 s at reference write speed; heartbeats every 10 s (cum GiB + GiB/s).
+- Teardown after numbers recorded — **SUBAGENT ONLY** (`wb` CLI blocks 10–20 min silently):
+  `wb resource delete --id=t4-io3 --quiet`.
 
-## Step 1 - Create the cluster (run in your TERMINAL, not here)
+## HANDOVER_2026-09-29 binding notes (v3 status)
+- **hostimg policy is now enforced by the generator itself**: the launch recipe builds/reuses
+  `hostimg` (`docker image inspect hostimg || tar -c -C / bin lib lib64 usr | docker import - hostimg`,
+  timeout 900, heartbeat POST to the sink BEFORE the build) and runs container-native `/bin/bash`.
+  The two legacy banned strings appear in ZERO cells — `harness_check.py` scans generated cells,
+  inner payloads, and THIS file for them on every kit edit.
+- **ONE hostimg build per worker, ever**: tasks serialize on `/tmp/.hostimg-build.lock` (executor
+  /tmp is host-visible — the proven FR handshake), so the "8×3GB import storm jammed both daemons"
+  failure mode is structurally gone. First cell that launches pays ~2 min; cached after.
+- Session-first: C2 pins 6 executors (greedy-placement fix), `excludeOnFailure` off (RM flap guard);
+  C3–C7 run `MODE: session` in 2–5 s. Zone us-central1-b; NEVER NVME on n1+T4; rc=125 benign;
+  big concurrent docker imports banned (see lock above).
+- FILL byte-count bug fixed in v3: v2 `dd bs=4M count=$FILL_GIB` wrote only `FILL_GIB×4 MiB`;
+  v3 uses `count=$((FILL_GIB*256))` so the contract file is really 40 GiB.
 
-```bash
-wb resource create dataproc-cluster \
-  --id=ssd-raid0 \
-  --region=us-central1 \
-  --quiet --format=JSON \
-  --num-workers=2 \
-  --worker-machine-type=n1-standard-16 \
-  --worker-accelerator-type=nvidia-tesla-t4 \
-  --worker-accelerator-count=1 \
-  --worker-boot-disk-size=100 \
-  --worker-num-local-ssds=16
-```
-
-The parameters:
-- `--id` - name of the cluster. Use the same name in step 3 below.
-- `--num-workers=2` - two worker machines. Each one gets its own local SSDs.
-- `--worker-machine-type` - n1-standard-16 (16 CPUs, 60 GB RAM) is the cheapest shape
-  allowed to carry a T4 (Google requires >=16 vCPUs per T4). More CPUs/RAM do NOT make
-  the disks faster: the speed cap depends only on the number of local SSDs.
-- `--worker-accelerator-type/-count` - one T4 GPU per worker (only needed for the GPU
-  chapter at the end; leave both out for a pure disk test).
-- `--worker-num-local-ssds=16` - THE parameter that matters: 375 GiB each, speed cap grows
-  linearly with this count.
-
-If a create ends in status ERROR with no reason: that is this tenant swallowing the real
-cause (their code drops the error details); retry once - GPU provisioning fails
-occasionally on capacity and a retry usually passes.
-
-## Step 2 - Wait until it runs (terminal)
-
-```bash
-wb resource describe --id=ssd-raid0 --format=JSON | grep -E '"status"|"proxyUri"'
-```
-
-Wait for `"status": "RUNNING"` and copy the `proxyUri` link. That link opens JupyterLab
-of the cluster. Note: the create/delete commands print nothing for 10-20 minutes. That is
-normal, they are working, not frozen.
-
-## Step 3 - Open JupyterLab, start THIS notebook
-
-Open the proxyUri link. Create a new notebook and pick the **Python 3** kernel
-(NOT "PySpark" - the PySpark kernel starts a background Spark app that causes noise).
-
-Set the cluster name here - everything below uses it:
-
-## Step 3b - Set the cluster name (used by nothing below automatically; the worker code derives names by itself)
-
-Just a label so you can see what this notebook is pointed at:
-
+## C0 — clean YARN (RAW) — FIRST, always: orphan apps survive restarts  [cell_1_kill_yarn.txt]
 ```python
-CLUSTER = "ssd-raid0"   # the --id you used in step 1
-print("using cluster:", CLUSTER)
+# === C0 CLEAN YARN — kill auto-submitted / orphan YARN apps (frees the workers) ===
+# FIRST cell, run on every fresh kernel/cluster. A kernel restart does NOT kill executor apps
+# on the workers — orphans must die before C2. GREEN: "C0 CLEAN: no YARN apps" or one KILLED
+# line per RUNNING/ACCEPTED app. RM warm-up right after create is retried IN THIS CELL (never
+# requires a second run). History: v1 KeyError'd when RM returns {"apps":{}} (zero apps, fresh
+# cluster, t4-io5 2026-10-02).
+import subprocess, json, time
+apps = None
+for attempt in range(8):
+    r = subprocess.run(["sudo","curl","-s","-m10","http://localhost:8088/ws/v1/cluster/apps"], capture_output=True, text=True, timeout=30)
+    try:
+        apps = json.loads(r.stdout).get("apps") or {}
+        break
+    except Exception:
+        print("C0: RM not answering yet (attempt %d/8, waiting 15s) head=%r" % (attempt + 1, r.stdout[:80]), flush=True)
+        time.sleep(15)
+if apps is None:
+    print("C0 FAIL: RM never answered in 2 min — restart kernel, run the file from C0", flush=True)
+    raise SystemExit
+applist = apps.get("app") or []
+if isinstance(applist, dict):
+    applist = [applist]
+if not applist:
+    print("C0 CLEAN: no YARN apps (nothing to kill)", flush=True)
+for a in applist:
+    if a["state"] in ("ACCEPTED", "RUNNING"):
+        k = subprocess.run(f"sudo -u yarn yarn application -kill {a['id']}", shell=True, capture_output=True, text=True, timeout=60)
+        print("KILLED", a["id"], "->", (k.stdout or k.stderr).strip()[-80:], flush=True)
+    else:
+        print(a["id"], a["state"], a["finalStatus"], flush=True)
 ```
 
-## How to get this notebook onto your cluster (pick one)
-
-1. **Copy cells one by one** from this page - everything here is plain readable code.
-   Copy carefully: if your browser or chat tool renders text as rich text/markdown, it can
-   silently eat backslashes and dollar signs (the failure looks like "job failed" with a
-   Python SyntaxError inside). If a cell fails with SyntaxError, re-copy it.
-2. **Let the cluster fetch the code itself** (recommended): paste the tiny loader cell below
-   ONCE, then run each step by changing one word. The step names match the file names in the
-   `cells/` folder of this repository, so the code on GitHub and the code you run can never
-   drift apart. Use `CELL = "listener"` only if you did not run the listener cell directly
-   (the listener must run in the same kernel as everything else, and stay alive).
-
-Names in order: `listener`, `clean`, `iface`, `stripe`, `fetchlogs`, `health`, `write40g`,
-`read3x`, `queue8`, `gpu_check`, `gpu_h2d`, `gpu_fetch`, `stripdiag`.
-
+## C1 — sink (RAW, self-test)  [cell_0_sink.txt]
 ```python
-import urllib.request
-CELL = "stripe"   # <- change this ONE word per step, then run the cell
-URL = "https://raw.githubusercontent.com/Information-and-learning-for-genomics/allofus-verily-wb-raid0-io/main/cells/"
-src = urllib.request.urlopen(URL + CELL + ".py", timeout=30).read().decode()
-print("=== running step:", CELL, "|", len(src), "chars ===")
-exec(compile(src, CELL, "exec"))
-```
-
-### Rescue cell: repair an old/corrupted copy of this notebook
-
-If your JupyterLab still has a copy whose cells got mangled by copy-paste (garbled `$()`
-fragments, SyntaxErrors that make no sense), run the cell below IN THAT OLD NOTEBOOK: it
-downloads this notebook byte-for-byte from GitHub into your folder as `raid0-clean.ipynb`.
-Then: shut down the old kernel, open `raid0-clean.ipynb`, pick the Python 3 kernel, and
-continue from the top (listener first).
-
-```python
-import urllib.request
-URL = "https://raw.githubusercontent.com/Information-and-learning-for-genomics/allofus-verily-wb-raid0-io/main/local-ssd-raid0-io-test.ipynb"
-data = urllib.request.urlopen(URL, timeout=60).read()
-open("raid0-clean.ipynb", "wb").write(data)
-print("saved", len(data), "bytes as raid0-clean.ipynb - refresh the file browser and open it")
-```
-
-## Step 4 - Start the result printer (run first, keep it alive)
-
-The slow tests run in the background ON THE WORKER MACHINES and send their progress lines
-to this cell while they work. Start this and leave it alone (the cell stays busy - that is
-the point). If you stop it, you will not see the test results.
-
-```python
-import threading, http.server, socketserver, time
-try:
-    LOGS
-    print("listener already up; LOGS:", list(LOGS))
-except NameError:
+# === C1 FRESH SINK — run right AFTER C0 (kill YARN); also after any kernel restart. Verifies, never lies. ===
+# Semantics: if a listener is PROVEN alive it is reused (LOGS cleared); otherwise a new one is
+# bound. Ends with a self-post round trip: GREEN = "SINK OK". Every later cell re-checks this.
+import threading, http.server, socketserver, time, socket
+LOGS = globals().get("LOGS")
+def __selfpost():
+    try:
+        s = socket.create_connection(("127.0.0.1", 18888), timeout=3)
+        body = b"c0-selftest"
+        head = ("POST /preflight-c0 HTTP/1.1\r\nHost: m\r\nContent-Length: "
+                + str(len(body)) + "\r\n\r\n").encode()
+        s.sendall(head + body)
+        return b"200" in s.recv(16)
+    except Exception:
+        return False
+if __selfpost():
+    LOGS.clear()
+    print("SINK OK (existing listener reused, LOGS cleared)", time.strftime("%H:%M:%S"), flush=True)
+else:
     LOGS = {}
     class HH(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             n = int(self.headers.get("Content-Length", 0))
             host = self.path.strip("/") or "unknown"
             LOGS[host] = self.rfile.read(n).decode(errors="replace")
-            print(f"\n===== {host} @ {time.strftime('%H:%M:%S')} =====\n...{LOGS[host][-500:]}", flush=True)
+            if not host.startswith("preflight"):
+                print(f"\n===== {host} @ {time.strftime('%H:%M:%S')} =====\n...{LOGS[host][-500:]}", flush=True)
             self.send_response(200); self.end_headers()
         def log_message(self, *a): pass
     class SRV(socketserver.ThreadingTCPServer):
         allow_reuse_address = True; daemon_threads = True
     threading.Thread(target=SRV(("0.0.0.0", 18888), HH).serve_forever, daemon=True).start()
-    print("listener started fresh")
+    time.sleep(0.4)
+    print("SINK OK (freshly bound)" if __selfpost() else "SINK FAIL — cannot bind/answer :18888; restart kernel, run the file from C0", flush=True)
 ```
 
-## Step 5 - Clean up stray Spark apps (optional, silences noise)
-
-Kills leftover Spark apps from earlier runs/sessions so they cannot hold the workers. Harmless if it says nothing.
-
+## C2 — pinned session (RAW / pyspark-in-kernel)  [cell_2_session.txt]
 ```python
-import subprocess, json
-r = subprocess.run(["sudo","curl","-s","-m10","http://localhost:8088/ws/v1/cluster/apps"], capture_output=True, text=True, timeout=30)
-for a in json.loads(r.stdout)["apps"]["app"]:
-    if a["state"] in ("ACCEPTED", "RUNNING"):
-        k = subprocess.run(f"sudo -u yarn yarn application -kill {a['id']}", shell=True, capture_output=True, text=True, timeout=60)
-        print("KILLED", a["id"], "->", (k.stdout or k.stderr).strip()[-80:], flush=True)
+# === C2 PINNED SESSION — run AFTER C0+C1. ONE SparkSession in the KERNEL for all later cells.
+# GREEN: "SESSION OK ... hosts=['...w-0', '...w-1']" (BOTH hosts). If hosts<2 it now SELF-HEALS
+# (stops + rebuilds with forced-spread sizing) instead of telling you to re-run.
+# Sizing logic: ask the RM what a worker node has; make each executor ~= HALF a node's cores so
+# at most 2 executors fit per worker => YARN must use both workers. (v1 used 6x1-core executors:
+# all six fit on one 32-core worker -> single-host session, t4-io5 2026-10-02 20:26.)
+# Works whether the tenant gives n1-standard-32 or the templated n1-standard-8 (uses RM truth).
+import os, sys, glob, socket, json, subprocess
+def __session_hosts(s):
+    return sorted(set(s.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
+def __node_shape():
+    try:
+        r = subprocess.run(["sudo","curl","-s","-m10","http://localhost:8088/ws/v1/cluster/nodes"],
+                           capture_output=True, text=True, timeout=30)
+        nodes = (json.loads(r.stdout).get("nodes") or {}).get("node") or []
+        cores = [n.get("availableVCores", 0) for n in nodes if n.get("state") == "RUNNING"]
+        return min(cores) if cores else 0
+    except Exception:
+        return 0
+__sc = globals().get("sc")
+__alive = False
+if __sc is not None:
+    try:
+        __alive = (__sc.parallelize([1], 1).count() == 1)
+    except Exception:
+        __alive = False
+if __alive and len(__session_hosts(__sc)) >= 2:
+    if "spark" not in globals():
+        globals()["spark"] = __sc.sparkSession
+    print("SESSION OK reused", flush=True)
+    hosts = __session_hosts(__sc)
+else:
+    if __alive:
+        print("session alive but single-host -> stopping and rebuilding with forced spread", flush=True)
+        try: __sc.stop()
+        except Exception: pass
+    try:
+        import pyspark  # noqa: F401
+    except ImportError:
+        os.environ.setdefault("SPARK_HOME", "/usr/lib/spark")
+        sys.path.insert(0, "/usr/lib/spark/python")
+        for _z in glob.glob("/usr/lib/spark/python/lib/py4j*.zip"):
+            sys.path.insert(0, _z)
+        import pyspark  # noqa: F401
+    from pyspark.sql import SparkSession
+    avail = __node_shape()
+    ecores = max(1, avail // 2) if avail else 1
+    print("RM min available vcores per worker =", avail, "-> executor cores =", ecores, flush=True)
+    b = (SparkSession.builder.appName("io_t4-session")
+         .config("spark.executor.cores", str(ecores))
+         .config("spark.executor.memory", "4g")
+         .config("spark.executor.memoryOverhead", "1g")
+         .config("spark.excludeOnFailure.enabled", "false")
+         .config("spark.executor.maxNumFailures", "1000"))
+    if avail:
+        b = b.config("spark.executor.instances", "4")   # 2 per worker x 2 workers
     else:
-        print(a["id"], a["state"], a["finalStatus"])
+        b = b.config("spark.executor.instances", "6")   # RM unknown -> old behavior
+    spark = b.getOrCreate()
+    sc = spark.sparkContext
+    sc.setLogLevel("ERROR")
+    globals()["spark"] = spark
+    globals()["sc"] = sc
+    print("SESSION OK new applicationId=", sc.applicationId, flush=True)
+    hosts = __session_hosts(sc)
+print("hosts=", hosts, flush=True)
+if len(hosts) < 2:
+    print("STILL SINGLE-HOST after rebuild — stop here, restart kernel, run the file from C0", flush=True)
 ```
 
-## Step 6 - Look at the disks (interface check)
-
-Runs a small job on both workers and prints the disk list per worker. Expect 16 lines of `sd... scsi LOCAL_SSD 375G` and `no-nvme-disks` - this tenant always attaches local SSDs as SCSI (the NVMe option is dropped by the platform on the way through). If only ONE worker prints, re-run this cell - YARN sometimes stacks both executors on one machine, that is noise, not a finding.
-
+## C3 — quiescence audit (uses session; QFRESH_PASS x2)  [cell_3_reset.txt]
 ```python
+# === io_t4 paste cell: 00_RESET.sh (emptyimg+loader-mount docker-root channel; sink tag T4R) ===
+# Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
+# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
+# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then QFRESH_PASS from BOTH workers in the SINK cell.
+# Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
+import subprocess, random, os, socket, time, base64
+def __preflight():
+    try:
+        s = socket.create_connection(("127.0.0.1", 18888), timeout=3)
+        body = b"pf-t4r"
+        head = ("POST /preflight-t4r HTTP/1.1\r\nHost: m\r\nContent-Length: "
+                + str(len(body)) + "\r\n\r\n").encode()
+        s.sendall(head + body)
+        return b"200" in s.recv(16)
+    except Exception:
+        return False
+PAY = base64.b64decode("IyEvYmluL2Jhc2gKIyBpb190NCAvIDAwX1JFU0VULnNoIOKAlCB3b3JrZXIgUVVJRVNDRU5DRSBBVURJVCAodjMpLiBJZGVtcG90ZW50LCByZWFkLW1vc3RseTogZmlyc3QgUkVNT1ZFUwojIG9ubHkgdGhpcyBraXQncyBhcnRpZmFjdHMgKG91ciBjb250YWluZXJzIC8gdG1wIGZpbGVzIC8gb3VyIHJhaWQpLCB0aGVuIFBST1ZFUyB0aGUgd29ya2VyIGlzCiMgcXVpZXQgQU5EIHRoZSBIYWRvb3AgY2x1c3RlciBpcyBzdGlsbCBoZWFsdGh5IChxdWllc2NlbmNlIG11c3QgbmV2ZXIgbGVhdmUgdGhlIGNsdXN0ZXIgYnJva2VuKS4KIyBORUVEIG1hcmtlcjogdGhlIFBPU1RlZCBib2R5IEVORFMgd2l0aCAiUUZSRVNIX1BBU1MgPG5jaGVja3M+IiBvciAiUUZSRVNIX0ZBSUwgPGZhaWxlZCBsaXN0PiIKIyAoc2luayBwcmludHMgUE9TVCB0YWlscywgc28gdGhlIHN1bW1hcnkgaXMgYWx3YXlzIHZpc2libGUpLiBSdW4gYXMgcm9vdCB2aWEgdGhlIHBhc3RlIGNlbGwuCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCkg9JChob3N0bmFtZSkKTUdSPSIke0glJS13LSp9LW0uJChob3N0bmFtZSAtZCkiCnBvc3QoKSB7IGN1cmwgLW01IC1zIC1YIFBPU1QgLS1kYXRhLWJpbmFyeSAiJDEiICJodHRwOi8vJE1HUjoxODg4OC8kMiIgfHwgdHJ1ZTsgfQojIG91ciBjb250YWluZXItbmFtZSBwYXR0ZXJucyBPTkxZICh0aGlzIGtpdCArIHByaW9yIGtpdCBnZW5lcmF0aW9ucyk6ClBBVD0nXih0NHxzdHJpcC18c3RyaXB8dy1bMC05YS1mXXxyLVswLTlhLWZdfHIyLVswLTlhLWZdfGgyLVswLTlhLWZdfHJvb3Rkb29yKScKTj0wOyBGQUlMRUQ9IiIKY2hrKCkgeyBlY2hvICJDSEsgJDE6ICQyICQzIjsgTj0kKChOKzEpKTsgaWYgWyAiJDIiID0gRkFJTCBdOyB0aGVuIEZBSUxFRD0iJEZBSUxFRCAkMSI7IGZpOyB9CnsKICBlY2hvICI9PSBRVUlFU0NFTkNFIEFVRElUICRIICQoZGF0ZSArJUg6JU06JVMpID09IgogICMgLS0tLS0tLS0tLSBjbGVhbnVwIChPVVIgYXJ0aWZhY3RzIG9ubHkpIC0tLS0tLS0tLS0KICBTRUxGPSItJHtUNF9TOi1ub25lfS0iCiAgZm9yIGMgaW4gJChkb2NrZXIgcHMgLWFxIC0tZm9ybWF0ICd7ey5OYW1lc319JyAyPi9kZXYvbnVsbCB8IGdyZXAgLUUgIiRQQVQiKTsgZG8KICAgIGNhc2UgIiRjIiBpbiAqIiRTRUxGIiopIGVjaG8gInNraXAtb3duLWNvbnRhaW5lciAkYyI7IGNvbnRpbnVlOzsgZXNhYwogICAgZG9ja2VyIHJtIC1mICIkYyIgPi9kZXYvbnVsbCAyPiYxICYmIGVjaG8gInJlbW92ZWQtY29udGFpbmVyICRjIgogIGRvbmUKICAjIEVYUExJQ0lUIGxpc3Qgb25seSDigJQgYSB0NCoub3V0IEdMT0IgaGVyZSBzZWxmLWRlbGV0ZXMgdDRyLm91dC90NGF1ZGl0Lm91dCBtaWQtcnVuCiAgIyAodW5saW5rLWFmdGVyLW9wZW4gPT4gZW1wdHkgcG9zdHMsIHBoYW50b20gcmM9MTsgaGl0IGxpdmUgMjAyNi0xMC0wMiAxNDo1NikuIE5ldmVyIGdsb2Igb3VyIG91dHB1dHMuCiAgcm0gLWYgL3RtcC90NCoubG9jayAvdG1wL3Q0cy5vdXQgL3RtcC90NGYub3V0IC90bXAvdDRiLm91dCAvdG1wL3Q0cC5vdXQgL3RtcC90NGQub3V0IFwKICAgICAgICAvdG1wL3Q0cy1mci5zaCAvdG1wL3Q0Zi1mci5zaCAvdG1wL3Q0Yi1mci5zaCAvdG1wL3Q0cC1mci5zaCAvdG1wL3Q0ZC1mci5zaCBcCiAgICAgICAgL3RtcC9zZXR1cC10NC5zaCAvdG1wL2ZpbGwtcnVuLnNoIC90bXAvYmVuY2hfdDQucHkgL3RtcC9wcm9iZS1ncHUuc2ggXAogICAgICAgIC90bXAvZGlhZy10NC5zaCAvdG1wL3N0cmlwLWhvc3Quc2ggL3RtcC9zdHJpcC12Ki5zaCAvdG1wL3cuc2ggL3RtcC9yKi5zaAogIGVjaG8gImZpbGVzOiBraXQgdG1wIGZpbGVzIHJlbW92ZWQiCiAgaWYgZ3JlcCAtcSAiIC9tbnQvcmFpZCAiIC9wcm9jL21vdW50czsgdGhlbgogICAgdW1vdW50IC9tbnQvcmFpZCAmJiBlY2hvICJ1bW91bnRlZCAvbW50L3JhaWQiIHx8IGVjaG8gIlVNT1VOVF9GQUlMIChidXN5PyBjaGVjayBwcm9jcykiCiAgZmkKICBpZiBkbXNldHVwIGluZm8gc3NkcmFpZCA+L2Rldi9udWxsIDI+JjE7IHRoZW4KICAgIGRtc2V0dXAgcmVtb3ZlIHNzZHJhaWQgJiYgZWNobyAiZG0gc3NkcmFpZCByZW1vdmVkIiB8fCBlY2hvICJETV9SRU1PVkVfRkFJTCIKICBmaQogICMgLS0tLS0tLS0tLSBhdWRpdCAoZWFjaCBsaW5lOiBDSEsgPG5hbWU+OiBQQVNTfEZBSUwgPGRldGFpbD4pIC0tLS0tLS0tLS0KICBSVU49JChkb2NrZXIgcHMgLS1mb3JtYXQgJ3t7Lk5hbWVzfX0nIDI+L2Rldi9udWxsIHwgZ3JlcCAtRSAiJFBBVCIgfCBncmVwIC12IC0tICItJHtUNF9TOi1ub25lfS0iIHwgdHIgJ1xuJyAnICcpCiAgaWYgWyAteiAiJFJVTiIgXTsgdGhlbiBjaGsgY29udGFpbmVycyBQQVNTIG5vbmUtcnVubmluZzsgZWxzZSBjaGsgY29udGFpbmVycyBGQUlMICJydW5uaW5nOiAkUlVOIjsgZmkKICBQUk9DUz0kKHBncmVwIC1mICJkZCAuKmJlbmNoZmlsZXxiZW5jaF90NHxmaWxsLXJ1bnxxdWV1ZTgiIDI+L2Rldi9udWxsIHwgdHIgJ1xuJyAnICcpCiAgaWYgWyAteiAiJFBST0NTIiBdOyB0aGVuIGNoayBwcm9jcyBQQVNTIG5vbmU7IGVsc2UgY2hrIHByb2NzIEZBSUwgInBpZHM6JFBST0NTIjsgZmkKICBpZiBncmVwIC1xICIgL21udC9yYWlkICIgL3Byb2MvbW91bnRzOyB0aGVuIGNoayByYWlkX21vdW50IEZBSUwgc3RpbGwtbW91bnRlZDsgZWxzZSBjaGsgcmFpZF9tb3VudCBQQVNTIG5vdC1tb3VudGVkOyBmaQogIGlmIGRtc2V0dXAgaW5mbyBzc2RyYWlkID4vZGV2L251bGwgMj4mMTsgdGhlbiBjaGsgZG1fZGV2aWNlIEZBSUwgc3NkcmFpZC1leGlzdHM7IGVsc2UgY2hrIGRtX2RldmljZSBQQVNTIGFic2VudDsgZmkKICBMUz0kKGxzIC90bXAvdDQqLmxvY2sgMj4vZGV2L251bGwgfCB0ciAnXG4nICcgJykKICBpZiBbIC16ICIkTFMiIF07IHRoZW4gY2hrIGxvY2tzIFBBU1Mgbm9uZTsgZWxzZSBjaGsgbG9ja3MgRkFJTCAiJExTIjsgZmkKICBETj0kKHN5c3RlbWN0bCBpcy1hY3RpdmUgaGFkb29wLWhkZnMtZGF0YW5vZGUgMj4mMSkKICBOTT0kKHN5c3RlbWN0bCBpcy1hY3RpdmUgaGFkb29wLXlhcm4tbm9kZW1hbmFnZXIgMj4mMSkKICBpZiBbICIkRE4iID0gYWN0aXZlIF0gJiYgWyAiJE5NIiA9IGFjdGl2ZSBdOyB0aGVuIGNoayBjbHVzdGVyX3NlcnZpY2VzIFBBU1MgZG49YWN0aXZlIG5tPWFjdGl2ZQogIGVsc2UgY2hrIGNsdXN0ZXJfc2VydmljZXMgRkFJTCAiZG49JEROIG5tPSROTSAoZXhwZWN0IGFjdGl2ZTsgaWYgYSBiZW5jaCBsZWZ0IHNlcnZpY2VzIGRvd246IHJlc3RhcnQgYm90aCkiOyBmaQogIGlmIGNvbW1hbmQgLXYgbnZpZGlhLXNtaSA+L2Rldi9udWxsIDI+JjE7IHRoZW4KICAgIEFQUFM9JChudmlkaWEtc21pIC0tcXVlcnktY29tcHV0ZS1hcHBzPXBpZCAtLWZvcm1hdD1jc3Ysbm9oZWFkZXIgMj4vZGV2L251bGwgfCB0ciAnXG4nICcgJykKICAgIGlmIFsgLXogIiRBUFBTIiBdOyB0aGVuIGNoayBncHUgUEFTUyBuby1jb21wdXRlLWFwcHM7IGVsc2UgY2hrIGdwdSBGQUlMICJhcHBzOiRBUFBTIjsgZmkKICBlbHNlCiAgICBjaGsgZ3B1IFBBU1MgIkdQVTogTkEobm8gZHJpdmVyKSIKICBmaQogIFJDPSQoY3VybCAtcyAtbTUgLW8gL2Rldi9udWxsIC13ICIle2h0dHBfY29kZX0iIC1YIFBPU1QgLS1kYXRhLWJpbmFyeSAiYXVkaXQtc2luay10ZXN0LSRIIiAiaHR0cDovLyRNR1I6MTg4ODgvYXVkaXQtJEgiKQogIGlmIFsgIiRSQyIgPSAyMDAgXTsgdGhlbiBjaGsgc2luayBQQVNTIGh0dHA9MjAwOyBlbHNlIGNoayBzaW5rIEZBSUwgImh0dHA9JFJDIChzaW5rIGRlYWQgLT4gcmVzdGFydCBrZXJuZWwsIHJ1biBmcm9tIEMwKSI7IGZpCiAgaWYgWyAteiAiJEZBSUxFRCIgXTsgdGhlbiBlY2hvICJRRlJFU0hfUEFTUyAkTiI7IGVsc2UgZWNobyAiUUZSRVNIX0ZBSUwkRkFJTEVEIjsgZmkKfSA+IC90bXAvdDRhdWRpdC5vdXQgMj4mMQpwb3N0ICIkKGNhdCAvdG1wL3Q0YXVkaXQub3V0KSIgInQ0cmVzZXQtJEgiCmNhdCAvdG1wL3Q0YXVkaXQub3V0Cg==").decode()
+FR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRyLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRyLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNFJfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRSX0xBVU5DSEVEICRIIFM9JFMiCi9iaW4vYmFzaCAvdG1wL3Jlc2V0LXQ0LnNoICA+PiAvdG1wL3Q0ci5vdXQgMj4mMQpwb3N0ICJUNFJfRVhJVCAkSCByYz0kPyB0YWlsOiAkKHRhaWwgLWMgMzAwIC90bXAvdDRyLm91dCkiCg==").decode()
+SFX = "%04x" % random.randrange(65536)
+_fq = socket.getfqdn()
+if "." not in _fq:
+    _d = subprocess.run("hostname -d", shell=True, capture_output=True, text=True).stdout.strip()
+    _fq = socket.gethostname().split(".")[0] + "." + _d if _d else socket.gethostname().split(".")[0]
+MGRFQ = _fq
+def __t4_launch():
+    h = socket.gethostname().split(".")[0]
+    open("/tmp/reset-t4.sh", "w").write(PAY)
+    open("/tmp/t4r-fr.sh", "w").write(FR)
+    # RESOLVE bash, don't assume it: executors ARE host processes, so shutil.which("bash") here
+    # returns the host's own bash -> the exact file visible at /host<that path> once / is mounted.
+    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian's /bin/bash.
+    import shutil
+    _b = shutil.which("bash") or subprocess.run(
+        "find / -maxdepth 4 \( -path /proc -o -path /sys -o -path /var/lib/docker \) -prune "
+        "-o -name bash -type f -print 2>/dev/null | head -1",
+        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"
+    HB = "/host" + _b
+    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"
+                   " || tar -c --files-from /dev/null | docker import - emptyimg",
+                   shell=True, capture_output=True, timeout=60)
+    r = subprocess.run("docker run -d --name t4r-" + SFX + "-" + h +
+                       " --privileged --pid=host --uts=host --network=host --ipc=host "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "
+                       + HB + " -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4r-fr.sh " + SFX + "'",
+                       shell=True, capture_output=True, text=True)
+    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]
+
+if not __preflight():
+    print("PREFLIGHT FAIL: sink not answering on :18888 -> restart kernel, run this file from C0.", flush=True)
+else:
+    print("PREFLIGHT_OK sink alive", time.strftime("%H:%M:%S"), flush=True)
+    __sc = globals().get("sc")
+    __live = False
+    if __sc is not None:
+        try:
+            __live = (__sc.parallelize([1], 1).count() == 1)
+        except Exception:
+            __live = False
+    if __live:
+        print("MODE: session", flush=True)
+        for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
+            print("WL:", x[:250], flush=True)
+    else:
+        print("MODE: spark-submit fallback (no live session -> if AFTER C2, contract broken: restart kernel, run from C0; costs 1-3 min)", flush=True)
+        JOB = 'import base64, socket, subprocess, os\nPAY = base64.b64decode("IyEvYmluL2Jhc2gKIyBpb190NCAvIDAwX1JFU0VULnNoIOKAlCB3b3JrZXIgUVVJRVNDRU5DRSBBVURJVCAodjMpLiBJZGVtcG90ZW50LCByZWFkLW1vc3RseTogZmlyc3QgUkVNT1ZFUwojIG9ubHkgdGhpcyBraXQncyBhcnRpZmFjdHMgKG91ciBjb250YWluZXJzIC8gdG1wIGZpbGVzIC8gb3VyIHJhaWQpLCB0aGVuIFBST1ZFUyB0aGUgd29ya2VyIGlzCiMgcXVpZXQgQU5EIHRoZSBIYWRvb3AgY2x1c3RlciBpcyBzdGlsbCBoZWFsdGh5IChxdWllc2NlbmNlIG11c3QgbmV2ZXIgbGVhdmUgdGhlIGNsdXN0ZXIgYnJva2VuKS4KIyBORUVEIG1hcmtlcjogdGhlIFBPU1RlZCBib2R5IEVORFMgd2l0aCAiUUZSRVNIX1BBU1MgPG5jaGVja3M+IiBvciAiUUZSRVNIX0ZBSUwgPGZhaWxlZCBsaXN0PiIKIyAoc2luayBwcmludHMgUE9TVCB0YWlscywgc28gdGhlIHN1bW1hcnkgaXMgYWx3YXlzIHZpc2libGUpLiBSdW4gYXMgcm9vdCB2aWEgdGhlIHBhc3RlIGNlbGwuCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCkg9JChob3N0bmFtZSkKTUdSPSIke0glJS13LSp9LW0uJChob3N0bmFtZSAtZCkiCnBvc3QoKSB7IGN1cmwgLW01IC1zIC1YIFBPU1QgLS1kYXRhLWJpbmFyeSAiJDEiICJodHRwOi8vJE1HUjoxODg4OC8kMiIgfHwgdHJ1ZTsgfQojIG91ciBjb250YWluZXItbmFtZSBwYXR0ZXJucyBPTkxZICh0aGlzIGtpdCArIHByaW9yIGtpdCBnZW5lcmF0aW9ucyk6ClBBVD0nXih0NHxzdHJpcC18c3RyaXB8dy1bMC05YS1mXXxyLVswLTlhLWZdfHIyLVswLTlhLWZdfGgyLVswLTlhLWZdfHJvb3Rkb29yKScKTj0wOyBGQUlMRUQ9IiIKY2hrKCkgeyBlY2hvICJDSEsgJDE6ICQyICQzIjsgTj0kKChOKzEpKTsgaWYgWyAiJDIiID0gRkFJTCBdOyB0aGVuIEZBSUxFRD0iJEZBSUxFRCAkMSI7IGZpOyB9CnsKICBlY2hvICI9PSBRVUlFU0NFTkNFIEFVRElUICRIICQoZGF0ZSArJUg6JU06JVMpID09IgogICMgLS0tLS0tLS0tLSBjbGVhbnVwIChPVVIgYXJ0aWZhY3RzIG9ubHkpIC0tLS0tLS0tLS0KICBTRUxGPSItJHtUNF9TOi1ub25lfS0iCiAgZm9yIGMgaW4gJChkb2NrZXIgcHMgLWFxIC0tZm9ybWF0ICd7ey5OYW1lc319JyAyPi9kZXYvbnVsbCB8IGdyZXAgLUUgIiRQQVQiKTsgZG8KICAgIGNhc2UgIiRjIiBpbiAqIiRTRUxGIiopIGVjaG8gInNraXAtb3duLWNvbnRhaW5lciAkYyI7IGNvbnRpbnVlOzsgZXNhYwogICAgZG9ja2VyIHJtIC1mICIkYyIgPi9kZXYvbnVsbCAyPiYxICYmIGVjaG8gInJlbW92ZWQtY29udGFpbmVyICRjIgogIGRvbmUKICAjIEVYUExJQ0lUIGxpc3Qgb25seSDigJQgYSB0NCoub3V0IEdMT0IgaGVyZSBzZWxmLWRlbGV0ZXMgdDRyLm91dC90NGF1ZGl0Lm91dCBtaWQtcnVuCiAgIyAodW5saW5rLWFmdGVyLW9wZW4gPT4gZW1wdHkgcG9zdHMsIHBoYW50b20gcmM9MTsgaGl0IGxpdmUgMjAyNi0xMC0wMiAxNDo1NikuIE5ldmVyIGdsb2Igb3VyIG91dHB1dHMuCiAgcm0gLWYgL3RtcC90NCoubG9jayAvdG1wL3Q0cy5vdXQgL3RtcC90NGYub3V0IC90bXAvdDRiLm91dCAvdG1wL3Q0cC5vdXQgL3RtcC90NGQub3V0IFwKICAgICAgICAvdG1wL3Q0cy1mci5zaCAvdG1wL3Q0Zi1mci5zaCAvdG1wL3Q0Yi1mci5zaCAvdG1wL3Q0cC1mci5zaCAvdG1wL3Q0ZC1mci5zaCBcCiAgICAgICAgL3RtcC9zZXR1cC10NC5zaCAvdG1wL2ZpbGwtcnVuLnNoIC90bXAvYmVuY2hfdDQucHkgL3RtcC9wcm9iZS1ncHUuc2ggXAogICAgICAgIC90bXAvZGlhZy10NC5zaCAvdG1wL3N0cmlwLWhvc3Quc2ggL3RtcC9zdHJpcC12Ki5zaCAvdG1wL3cuc2ggL3RtcC9yKi5zaAogIGVjaG8gImZpbGVzOiBraXQgdG1wIGZpbGVzIHJlbW92ZWQiCiAgaWYgZ3JlcCAtcSAiIC9tbnQvcmFpZCAiIC9wcm9jL21vdW50czsgdGhlbgogICAgdW1vdW50IC9tbnQvcmFpZCAmJiBlY2hvICJ1bW91bnRlZCAvbW50L3JhaWQiIHx8IGVjaG8gIlVNT1VOVF9GQUlMIChidXN5PyBjaGVjayBwcm9jcykiCiAgZmkKICBpZiBkbXNldHVwIGluZm8gc3NkcmFpZCA+L2Rldi9udWxsIDI+JjE7IHRoZW4KICAgIGRtc2V0dXAgcmVtb3ZlIHNzZHJhaWQgJiYgZWNobyAiZG0gc3NkcmFpZCByZW1vdmVkIiB8fCBlY2hvICJETV9SRU1PVkVfRkFJTCIKICBmaQogICMgLS0tLS0tLS0tLSBhdWRpdCAoZWFjaCBsaW5lOiBDSEsgPG5hbWU+OiBQQVNTfEZBSUwgPGRldGFpbD4pIC0tLS0tLS0tLS0KICBSVU49JChkb2NrZXIgcHMgLS1mb3JtYXQgJ3t7Lk5hbWVzfX0nIDI+L2Rldi9udWxsIHwgZ3JlcCAtRSAiJFBBVCIgfCBncmVwIC12IC0tICItJHtUNF9TOi1ub25lfS0iIHwgdHIgJ1xuJyAnICcpCiAgaWYgWyAteiAiJFJVTiIgXTsgdGhlbiBjaGsgY29udGFpbmVycyBQQVNTIG5vbmUtcnVubmluZzsgZWxzZSBjaGsgY29udGFpbmVycyBGQUlMICJydW5uaW5nOiAkUlVOIjsgZmkKICBQUk9DUz0kKHBncmVwIC1mICJkZCAuKmJlbmNoZmlsZXxiZW5jaF90NHxmaWxsLXJ1bnxxdWV1ZTgiIDI+L2Rldi9udWxsIHwgdHIgJ1xuJyAnICcpCiAgaWYgWyAteiAiJFBST0NTIiBdOyB0aGVuIGNoayBwcm9jcyBQQVNTIG5vbmU7IGVsc2UgY2hrIHByb2NzIEZBSUwgInBpZHM6JFBST0NTIjsgZmkKICBpZiBncmVwIC1xICIgL21udC9yYWlkICIgL3Byb2MvbW91bnRzOyB0aGVuIGNoayByYWlkX21vdW50IEZBSUwgc3RpbGwtbW91bnRlZDsgZWxzZSBjaGsgcmFpZF9tb3VudCBQQVNTIG5vdC1tb3VudGVkOyBmaQogIGlmIGRtc2V0dXAgaW5mbyBzc2RyYWlkID4vZGV2L251bGwgMj4mMTsgdGhlbiBjaGsgZG1fZGV2aWNlIEZBSUwgc3NkcmFpZC1leGlzdHM7IGVsc2UgY2hrIGRtX2RldmljZSBQQVNTIGFic2VudDsgZmkKICBMUz0kKGxzIC90bXAvdDQqLmxvY2sgMj4vZGV2L251bGwgfCB0ciAnXG4nICcgJykKICBpZiBbIC16ICIkTFMiIF07IHRoZW4gY2hrIGxvY2tzIFBBU1Mgbm9uZTsgZWxzZSBjaGsgbG9ja3MgRkFJTCAiJExTIjsgZmkKICBETj0kKHN5c3RlbWN0bCBpcy1hY3RpdmUgaGFkb29wLWhkZnMtZGF0YW5vZGUgMj4mMSkKICBOTT0kKHN5c3RlbWN0bCBpcy1hY3RpdmUgaGFkb29wLXlhcm4tbm9kZW1hbmFnZXIgMj4mMSkKICBpZiBbICIkRE4iID0gYWN0aXZlIF0gJiYgWyAiJE5NIiA9IGFjdGl2ZSBdOyB0aGVuIGNoayBjbHVzdGVyX3NlcnZpY2VzIFBBU1MgZG49YWN0aXZlIG5tPWFjdGl2ZQogIGVsc2UgY2hrIGNsdXN0ZXJfc2VydmljZXMgRkFJTCAiZG49JEROIG5tPSROTSAoZXhwZWN0IGFjdGl2ZTsgaWYgYSBiZW5jaCBsZWZ0IHNlcnZpY2VzIGRvd246IHJlc3RhcnQgYm90aCkiOyBmaQogIGlmIGNvbW1hbmQgLXYgbnZpZGlhLXNtaSA+L2Rldi9udWxsIDI+JjE7IHRoZW4KICAgIEFQUFM9JChudmlkaWEtc21pIC0tcXVlcnktY29tcHV0ZS1hcHBzPXBpZCAtLWZvcm1hdD1jc3Ysbm9oZWFkZXIgMj4vZGV2L251bGwgfCB0ciAnXG4nICcgJykKICAgIGlmIFsgLXogIiRBUFBTIiBdOyB0aGVuIGNoayBncHUgUEFTUyBuby1jb21wdXRlLWFwcHM7IGVsc2UgY2hrIGdwdSBGQUlMICJhcHBzOiRBUFBTIjsgZmkKICBlbHNlCiAgICBjaGsgZ3B1IFBBU1MgIkdQVTogTkEobm8gZHJpdmVyKSIKICBmaQogIFJDPSQoY3VybCAtcyAtbTUgLW8gL2Rldi9udWxsIC13ICIle2h0dHBfY29kZX0iIC1YIFBPU1QgLS1kYXRhLWJpbmFyeSAiYXVkaXQtc2luay10ZXN0LSRIIiAiaHR0cDovLyRNR1I6MTg4ODgvYXVkaXQtJEgiKQogIGlmIFsgIiRSQyIgPSAyMDAgXTsgdGhlbiBjaGsgc2luayBQQVNTIGh0dHA9MjAwOyBlbHNlIGNoayBzaW5rIEZBSUwgImh0dHA9JFJDIChzaW5rIGRlYWQgLT4gcmVzdGFydCBrZXJuZWwsIHJ1biBmcm9tIEMwKSI7IGZpCiAgaWYgWyAteiAiJEZBSUxFRCIgXTsgdGhlbiBlY2hvICJRRlJFU0hfUEFTUyAkTiI7IGVsc2UgZWNobyAiUUZSRVNIX0ZBSUwkRkFJTEVEIjsgZmkKfSA+IC90bXAvdDRhdWRpdC5vdXQgMj4mMQpwb3N0ICIkKGNhdCAvdG1wL3Q0YXVkaXQub3V0KSIgInQ0cmVzZXQtJEgiCmNhdCAvdG1wL3Q0YXVkaXQub3V0Cg==").decode()\nFR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRyLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRyLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNFJfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRSX0xBVU5DSEVEICRIIFM9JFMiCi9iaW4vYmFzaCAvdG1wL3Jlc2V0LXQ0LnNoICA+PiAvdG1wL3Q0ci5vdXQgMj4mMQpwb3N0ICJUNFJfRVhJVCAkSCByYz0kPyB0YWlsOiAkKHRhaWwgLWMgMzAwIC90bXAvdDRyLm91dCkiCg==").decode()\nMGRFQ = "localhost"\ndef __t4_launch():\n    h = socket.gethostname().split(".")[0]\n    open("/tmp/reset-t4.sh", "w").write(PAY)\n    open("/tmp/t4r-fr.sh", "w").write(FR)\n    # RESOLVE bash, don\'t assume it: executors ARE host processes, so shutil.which("bash") here\n    # returns the host\'s own bash -> the exact file visible at /host<that path> once / is mounted.\n    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian\'s /bin/bash.\n    import shutil\n    _b = shutil.which("bash") or subprocess.run(\n        "find / -maxdepth 4 \\( -path /proc -o -path /sys -o -path /var/lib/docker \\) -prune "\n        "-o -name bash -type f -print 2>/dev/null | head -1",\n        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"\n    HB = "/host" + _b\n    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"\n                   " || tar -c --files-from /dev/null | docker import - emptyimg",\n                   shell=True, capture_output=True, timeout=60)\n    r = subprocess.run("docker run -d --name t4r-" + SFX + "-" + h +\n                       " --privileged --pid=host --uts=host --network=host --ipc=host "\n                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "\n                       + HB + " -c \'/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4r-fr.sh " + SFX + "\'",\n                       shell=True, capture_output=True, text=True)\n    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]\n\nif __name__ == "__main__":\n    SFX = os.environ.get("SFX", "x")\n    from pyspark.sql import SparkSession\n    sp = SparkSession.builder.appName("t4r").getOrCreate()\n    for x in sorted(set(sp.sparkContext.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):\n        print("WL:", x, flush=True)\n    sp.stop()\n'
+        open("/tmp/job_t4r.py", "w").write(JOB)
+        p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
+            "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
+            "/tmp/job_t4r.py"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            env=dict(os.environ, SFX=SFX))
+        for line in p.stdout:
+            l = line.rstrip()
+            if l.startswith("WL:"):
+                print(l[:250], flush=True)
+        print("spark-submit rc:", p.wait(), flush=True)
+    print(">>> SINK cell: expect QFRESH_PASS from BOTH workers <<<", flush=True)
+```
+
+## C4 — probe (T4PROBE_DONE x2: CPU_RAM/GCE_MT/SSD_DATA/PCI_GPU/NVIDIA_SMI)  [cell_probe.txt]
+```python
+# === io_t4 paste cell: 03_PROBE_GPU.sh (emptyimg+loader-mount docker-root channel; sink tag T4P) ===
+# Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
+# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
+# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then T4PROBE_DONE from BOTH workers in the SINK cell.
+# Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
+import subprocess, random, os, socket, time, base64
+def __preflight():
+    try:
+        s = socket.create_connection(("127.0.0.1", 18888), timeout=3)
+        body = b"pf-t4p"
+        head = ("POST /preflight-t4p HTTP/1.1\r\nHost: m\r\nContent-Length: "
+                + str(len(body)) + "\r\n\r\n").encode()
+        s.sendall(head + body)
+        return b"200" in s.recv(16)
+    except Exception:
+        return False
+PAY = base64.b64decode("IyEvYmluL2Jhc2gKIyBpb190NCAvIDAzX1BST0JFX0dQVS5zaCDigJQgUkVBRC1PTkxZIHByb2JlLCBydW4gZmlyc3Qgb24gdDQtaW8yIHdvcmtlcnMuCiMgUXVlc3Rpb25zIGFuc3dlcmVkIChlYWNoID0gb25lIGxpbmUgaW4gdGhlIHNpbmsgUE9TVCk6CiMgICBQQ0lfR1BVICAgLT4gZGlkIHRoZSBUNCBwaHlzaWNhbGx5IGxhbmQgb24gdGhlIHdvcmtlcj8gKHRydWUgdGVzdCBvZiBXTSBhY2NlbGVyYXRvciBmb3J3YXJkaW5nKQojICAgTlZJRElBX1NNSS9DVURBUlQvQ1VEQV9ESVJTIC0+IGlzIHRoZSBkcml2ZXIvQ1VEQSBwcmVpbnN0YWxsZWQgb24gaW1hZ2UgMi4yLjU5LWRlYmlhbjEyPyAoZXhwZWN0IE5PKQojICAgS0hFQURFUlMvR0NDL0tFUk5FTCAtPiBpcyBhbiBvZmZsaW5lIC5ydW4gZHJpdmVyIGluc3RhbGwgZXZlbiBjb25jZWl2YWJsZT8KIyAgIEdTVVRJTC9TQSAtPiBjYW4gdGhlIHdvcmtlciBwdWxsIGRyaXZlci93aGVlbHMgZnJvbSB0aGUgd29ya3NwYWNlIEdDUyBidWNrZXQ/CiMgICBOVU1QWS9DT05EQSAtPiBweXRob24gZ3JvdW5kIHRydXRoIGZvciB0aGUgYmVuY2ggbGVncy4KIyBObyBtdXRhdGlvbiwgbm8gaW5zdGFsbHMsIG5vIHJtLiBQT1NUcyBhIHNob3J0IHZlcmRpY3QgKHNpbmsgcHJpbnRzIHRhaWwtNTAwIG9ubHkpLAojIGZ1bGwgdGV4dCBzdGF5cyBpbiAvdG1wL3Q0cC5vdXQgb24gdGhlIHdvcmtlciAoZmV0Y2ggY2VsbCBwdWxscyBpdCkuCkg9JChob3N0bmFtZSkKTUdSPSIke0glJS13LSp9LW0uJChob3N0bmFtZSAtZCkiCnBvc3QoKSB7IGN1cmwgLW01IC1zIC1YIFBPU1QgLS1kYXRhLWJpbmFyeSAiJDEiICJodHRwOi8vJE1HUjoxODg4OC90NHAtJEgiIHx8IHRydWU7IH0KewogIGVjaG8gIj09IFQ0UFJPQkUgJEggPT0iCiAgZWNobyAiQ1BVX1JBTTogbnByb2M9JChucHJvYykgbWVtX2dpYj0kKGF3ayAnL01lbVRvdGFsL3twcmludCBpbnQoJDIvMTA0ODU3Nil9JyAvcHJvYy9tZW1pbmZvKSIKICBlY2hvICJHQ0VfTVQ6ICQoY3VybCAtcyAtbTMgLUggJ01ldGFkYXRhLUZsYXZvcjogR29vZ2xlJyBodHRwOi8vbWV0YWRhdGEuZ29vZ2xlLmludGVybmFsL2NvbXB1dGVNZXRhZGF0YS92MS9pbnN0YW5jZS9tYWNoaW5lLXR5cGUgfHwgZWNobyBOT19NRVRBKSIKICAjIGNvdW50IEJJRyAoPj0zNTBHaUIpIGJsb2NrIGRldmljZXMgPSB0aGUgbG9jYWwgU1NEcywgdW5hbWJpZ3VvdXNseSAodGhlIG9sZCBieS1pZCBsaW5rIGNvdW50CiAgIyBkb3VibGUtY291bnRlZDogZXZlcnkgZGlzayBoYXMgc2NzaSt3d2lkIHN5bWxpbmtzOyBwcmludGVkIGEgZmFrZSAiMTYiIGZvciA4IGRpc2tzLCAyMDI2LTEwLTAyKQogIGVjaG8gIlNTRF9EQVRBOiAkKGZvciBkIGluIC9zeXMvYmxvY2svc2QqOyBkbyBbICIkKGNhdCAkZC9zaXplKSIgLWd0IDcwMDAwMDAwMCBdICYmIGVjaG8geDsgZG9uZSB8IHdjIC1sKSBzZF90b3RhbD0kKGxzIC1kIC9zeXMvYmxvY2svc2QqIDI+L2Rldi9udWxsIHwgd2MgLWwpIHNpemVzOiAkKGZvciBkIGluIC9zeXMvYmxvY2svc2QqOyBkbyBjYXQgJGQvc2l6ZTsgZG9uZSB8IHNvcnQgLXUgfCB0ciAnXG4nICcgJykiCiAgZWNobyAiUENJX0dQVTogJChsc3BjaSAyPi9kZXYvbnVsbCB8IGdyZXAgLWkgLUUgJ252aWRpYXwzRCBjb250cm9sbGVyJyB8IGhlYWQgLTIgfCB0ciAnXG4nICc7JyB8fCBlY2hvIExTUENJX0ZBSUwpIgogIGVjaG8gIkRFVk5PREVTOiAkKGxzIC9kZXYvbnZpZGlhKiAyPi9kZXYvbnVsbCB8IHRyICdcbicgJyAnKSIKICBlY2hvICJOVklESUFfU01JOiAkKGNvbW1hbmQgLXYgbnZpZGlhLXNtaSA+L2Rldi9udWxsIDI+JjEgJiYgKG52aWRpYS1zbWkgLS1xdWVyeS1ncHU9bmFtZSxkcml2ZXJfdmVyc2lvbiAtLWZvcm1hdD1jc3Ysbm9oZWFkZXIgMj4mMSB8IGhlYWQgLTEpIHx8IGVjaG8gQUJTRU5UKSIKICBlY2hvICJDVURBX0RJUlM6ICQobHMgLWQgL3Vzci9sb2NhbC9jdWRhKiAyPi9kZXYvbnVsbCB8IHRyICdcbicgJyAnKSIKICBlY2hvICJDVURBUlQ6ICQobGRjb25maWcgLXAgMj4vZGV2L251bGwgfCBncmVwIC1FICdsaWJjdWRhcnR8bGliY3VkYVwuc28nIHwgaGVhZCAtMyB8IHRyICdcbicgJzsnIHx8IGVjaG8gTk9ORSkiCiAgZWNobyAiRFBLR19OVjogJChkcGtnIC1sIDI+L2Rldi9udWxsIHwgZ3JlcCAtY2kgbnZpZGlhKSIKICBlY2hvICJLRVJORUw6ICQodW5hbWUgLXIpIgogIGVjaG8gIktIRUFERVJTOiAkKGxzIC1kIC9saWIvbW9kdWxlcy8kKHVuYW1lIC1yKS9idWlsZCAyPi9kZXYvbnVsbCB8fCBlY2hvIEFCU0VOVCkiCiAgZWNobyAiR0NDOiAkKGdjYyAtLXZlcnNpb24gMj4vZGV2L251bGwgfCBoZWFkIC0xIHx8IGVjaG8gQUJTRU5UKSIKICBlY2hvICJQWTM6ICQocHl0aG9uMyAtLXZlcnNpb24gMj4mMSkiCiAgZWNobyAiTlVNUFk6ICQocHl0aG9uMyAtYyAnaW1wb3J0IG51bXB5O3ByaW50KG51bXB5Ll9fdmVyc2lvbl9fKScgMj4mMSB8IHRhaWwgLTEpIgogIGVjaG8gIkNPTkRBOiAkKGxzIC1kIC9vcHQvY29uZGEgMj4vZGV2L251bGwgfHwgZWNobyBBQlNFTlQpIgogIGVjaG8gIkdTVVRJTDogJChjb21tYW5kIC12IGdzdXRpbCA+L2Rldi9udWxsIDI+JjEgJiYgKGdzdXRpbCB2ZXJzaW9uIDI+L2Rldi9udWxsIHwgaGVhZCAtMSkgfHwgZWNobyBBQlNFTlQpIgogIGVjaG8gIlNBOiAkKGN1cmwgLXMgLW0zIC1IICdNZXRhZGF0YS1GbGF2b3I6IEdvb2dsZScgaHR0cDovL21ldGFkYXRhLmdvb2dsZS5pbnRlcm5hbC9jb21wdXRlTWV0YWRhdGEvdjEvaW5zdGFuY2Uvc2VydmljZS1hY2NvdW50cy9kZWZhdWx0L2VtYWlsIDI+L2Rldi9udWxsIHx8IGVjaG8gTk9fTUVUQSkiCiAgZWNobyAiREZfUkFJRDogJChkZiAtaCAvbW50L3JhaWQgMj4vZGV2L251bGwgfCB0YWlsIC0xIHx8IGVjaG8gTk9UX01PVU5URUQpIgp9ID4gL3RtcC90NHAub3V0IDI+JjEKVj0iSE9TVD0kSCAkKGdyZXAgLUUgJ14oQ1BVX1JBTXxTU0RfREFUQXxQQ0lfR1BVfERFVk5PREVTfE5WSURJQV9TTUl8Q1VEQV9ESVJTfEtIRUFERVJTfEdDQ3xOVU1QWXxDT05EQXxHU1VUSUx8U0F8S0VSTkVMKScgL3RtcC90NHAub3V0IHwgdHIgJ1xuJyAnICcpIgpwb3N0ICIkViIKIyBzZWNvbmQsIFNIT1JUIHBvc3Qgc28gdGhlIHNpbmsncyB0YWlsLTUwMCBwcmludCBzaG93cyB0aGUgc2hhcGUtdHJ1dGggbGluZXMgKGNvbnNvbGUtY29zdCBhdWRpdCk6CkNPUkU9IkhPU1Q9JEggJChncmVwIC1FICdeKENQVV9SQU18R0NFX01UfFNTRF9EQVRBfFBDSV9HUFV8TlZJRElBX1NNSSknIC90bXAvdDRwLm91dCB8IHRyICdcbicgJyAnKSIKcG9zdCAiJHtDT1JFOjA6NDIwfSB8IFQ0UFJPQkVfRE9ORSIKZWNobyAiVDRQUk9CRV9ET05FIHBvc3RlZCIgPj4gL3RtcC90NHAub3V0Cg==").decode()
+FR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRwLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRwLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNFBfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRQX0xBVU5DSEVEICRIIFM9JFMiCi9iaW4vYmFzaCAvdG1wL3Byb2JlLWdwdS5zaCAgPj4gL3RtcC90NHAub3V0IDI+JjEKcG9zdCAiVDRQX0VYSVQgJEggcmM9JD8gdGFpbDogJCh0YWlsIC1jIDMwMCAvdG1wL3Q0cC5vdXQpIgo=").decode()
+SFX = "%04x" % random.randrange(65536)
+_fq = socket.getfqdn()
+if "." not in _fq:
+    _d = subprocess.run("hostname -d", shell=True, capture_output=True, text=True).stdout.strip()
+    _fq = socket.gethostname().split(".")[0] + "." + _d if _d else socket.gethostname().split(".")[0]
+MGRFQ = _fq
+def __t4_launch():
+    h = socket.gethostname().split(".")[0]
+    open("/tmp/probe-gpu.sh", "w").write(PAY)
+    open("/tmp/t4p-fr.sh", "w").write(FR)
+    # RESOLVE bash, don't assume it: executors ARE host processes, so shutil.which("bash") here
+    # returns the host's own bash -> the exact file visible at /host<that path> once / is mounted.
+    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian's /bin/bash.
+    import shutil
+    _b = shutil.which("bash") or subprocess.run(
+        "find / -maxdepth 4 \( -path /proc -o -path /sys -o -path /var/lib/docker \) -prune "
+        "-o -name bash -type f -print 2>/dev/null | head -1",
+        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"
+    HB = "/host" + _b
+    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"
+                   " || tar -c --files-from /dev/null | docker import - emptyimg",
+                   shell=True, capture_output=True, timeout=60)
+    r = subprocess.run("docker run -d --name t4p-" + SFX + "-" + h +
+                       " --privileged --pid=host --uts=host --network=host --ipc=host "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "
+                       + HB + " -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4p-fr.sh " + SFX + "'",
+                       shell=True, capture_output=True, text=True)
+    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]
+
+if not __preflight():
+    print("PREFLIGHT FAIL: sink not answering on :18888 -> restart kernel, run this file from C0.", flush=True)
+else:
+    print("PREFLIGHT_OK sink alive", time.strftime("%H:%M:%S"), flush=True)
+    __sc = globals().get("sc")
+    __live = False
+    if __sc is not None:
+        try:
+            __live = (__sc.parallelize([1], 1).count() == 1)
+        except Exception:
+            __live = False
+    if __live:
+        print("MODE: session", flush=True)
+        for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
+            print("WL:", x[:250], flush=True)
+    else:
+        print("MODE: spark-submit fallback (no live session -> if AFTER C2, contract broken: restart kernel, run from C0; costs 1-3 min)", flush=True)
+        JOB = 'import base64, socket, subprocess, os\nPAY = base64.b64decode("IyEvYmluL2Jhc2gKIyBpb190NCAvIDAzX1BST0JFX0dQVS5zaCDigJQgUkVBRC1PTkxZIHByb2JlLCBydW4gZmlyc3Qgb24gdDQtaW8yIHdvcmtlcnMuCiMgUXVlc3Rpb25zIGFuc3dlcmVkIChlYWNoID0gb25lIGxpbmUgaW4gdGhlIHNpbmsgUE9TVCk6CiMgICBQQ0lfR1BVICAgLT4gZGlkIHRoZSBUNCBwaHlzaWNhbGx5IGxhbmQgb24gdGhlIHdvcmtlcj8gKHRydWUgdGVzdCBvZiBXTSBhY2NlbGVyYXRvciBmb3J3YXJkaW5nKQojICAgTlZJRElBX1NNSS9DVURBUlQvQ1VEQV9ESVJTIC0+IGlzIHRoZSBkcml2ZXIvQ1VEQSBwcmVpbnN0YWxsZWQgb24gaW1hZ2UgMi4yLjU5LWRlYmlhbjEyPyAoZXhwZWN0IE5PKQojICAgS0hFQURFUlMvR0NDL0tFUk5FTCAtPiBpcyBhbiBvZmZsaW5lIC5ydW4gZHJpdmVyIGluc3RhbGwgZXZlbiBjb25jZWl2YWJsZT8KIyAgIEdTVVRJTC9TQSAtPiBjYW4gdGhlIHdvcmtlciBwdWxsIGRyaXZlci93aGVlbHMgZnJvbSB0aGUgd29ya3NwYWNlIEdDUyBidWNrZXQ/CiMgICBOVU1QWS9DT05EQSAtPiBweXRob24gZ3JvdW5kIHRydXRoIGZvciB0aGUgYmVuY2ggbGVncy4KIyBObyBtdXRhdGlvbiwgbm8gaW5zdGFsbHMsIG5vIHJtLiBQT1NUcyBhIHNob3J0IHZlcmRpY3QgKHNpbmsgcHJpbnRzIHRhaWwtNTAwIG9ubHkpLAojIGZ1bGwgdGV4dCBzdGF5cyBpbiAvdG1wL3Q0cC5vdXQgb24gdGhlIHdvcmtlciAoZmV0Y2ggY2VsbCBwdWxscyBpdCkuCkg9JChob3N0bmFtZSkKTUdSPSIke0glJS13LSp9LW0uJChob3N0bmFtZSAtZCkiCnBvc3QoKSB7IGN1cmwgLW01IC1zIC1YIFBPU1QgLS1kYXRhLWJpbmFyeSAiJDEiICJodHRwOi8vJE1HUjoxODg4OC90NHAtJEgiIHx8IHRydWU7IH0KewogIGVjaG8gIj09IFQ0UFJPQkUgJEggPT0iCiAgZWNobyAiQ1BVX1JBTTogbnByb2M9JChucHJvYykgbWVtX2dpYj0kKGF3ayAnL01lbVRvdGFsL3twcmludCBpbnQoJDIvMTA0ODU3Nil9JyAvcHJvYy9tZW1pbmZvKSIKICBlY2hvICJHQ0VfTVQ6ICQoY3VybCAtcyAtbTMgLUggJ01ldGFkYXRhLUZsYXZvcjogR29vZ2xlJyBodHRwOi8vbWV0YWRhdGEuZ29vZ2xlLmludGVybmFsL2NvbXB1dGVNZXRhZGF0YS92MS9pbnN0YW5jZS9tYWNoaW5lLXR5cGUgfHwgZWNobyBOT19NRVRBKSIKICAjIGNvdW50IEJJRyAoPj0zNTBHaUIpIGJsb2NrIGRldmljZXMgPSB0aGUgbG9jYWwgU1NEcywgdW5hbWJpZ3VvdXNseSAodGhlIG9sZCBieS1pZCBsaW5rIGNvdW50CiAgIyBkb3VibGUtY291bnRlZDogZXZlcnkgZGlzayBoYXMgc2NzaSt3d2lkIHN5bWxpbmtzOyBwcmludGVkIGEgZmFrZSAiMTYiIGZvciA4IGRpc2tzLCAyMDI2LTEwLTAyKQogIGVjaG8gIlNTRF9EQVRBOiAkKGZvciBkIGluIC9zeXMvYmxvY2svc2QqOyBkbyBbICIkKGNhdCAkZC9zaXplKSIgLWd0IDcwMDAwMDAwMCBdICYmIGVjaG8geDsgZG9uZSB8IHdjIC1sKSBzZF90b3RhbD0kKGxzIC1kIC9zeXMvYmxvY2svc2QqIDI+L2Rldi9udWxsIHwgd2MgLWwpIHNpemVzOiAkKGZvciBkIGluIC9zeXMvYmxvY2svc2QqOyBkbyBjYXQgJGQvc2l6ZTsgZG9uZSB8IHNvcnQgLXUgfCB0ciAnXG4nICcgJykiCiAgZWNobyAiUENJX0dQVTogJChsc3BjaSAyPi9kZXYvbnVsbCB8IGdyZXAgLWkgLUUgJ252aWRpYXwzRCBjb250cm9sbGVyJyB8IGhlYWQgLTIgfCB0ciAnXG4nICc7JyB8fCBlY2hvIExTUENJX0ZBSUwpIgogIGVjaG8gIkRFVk5PREVTOiAkKGxzIC9kZXYvbnZpZGlhKiAyPi9kZXYvbnVsbCB8IHRyICdcbicgJyAnKSIKICBlY2hvICJOVklESUFfU01JOiAkKGNvbW1hbmQgLXYgbnZpZGlhLXNtaSA+L2Rldi9udWxsIDI+JjEgJiYgKG52aWRpYS1zbWkgLS1xdWVyeS1ncHU9bmFtZSxkcml2ZXJfdmVyc2lvbiAtLWZvcm1hdD1jc3Ysbm9oZWFkZXIgMj4mMSB8IGhlYWQgLTEpIHx8IGVjaG8gQUJTRU5UKSIKICBlY2hvICJDVURBX0RJUlM6ICQobHMgLWQgL3Vzci9sb2NhbC9jdWRhKiAyPi9kZXYvbnVsbCB8IHRyICdcbicgJyAnKSIKICBlY2hvICJDVURBUlQ6ICQobGRjb25maWcgLXAgMj4vZGV2L251bGwgfCBncmVwIC1FICdsaWJjdWRhcnR8bGliY3VkYVwuc28nIHwgaGVhZCAtMyB8IHRyICdcbicgJzsnIHx8IGVjaG8gTk9ORSkiCiAgZWNobyAiRFBLR19OVjogJChkcGtnIC1sIDI+L2Rldi9udWxsIHwgZ3JlcCAtY2kgbnZpZGlhKSIKICBlY2hvICJLRVJORUw6ICQodW5hbWUgLXIpIgogIGVjaG8gIktIRUFERVJTOiAkKGxzIC1kIC9saWIvbW9kdWxlcy8kKHVuYW1lIC1yKS9idWlsZCAyPi9kZXYvbnVsbCB8fCBlY2hvIEFCU0VOVCkiCiAgZWNobyAiR0NDOiAkKGdjYyAtLXZlcnNpb24gMj4vZGV2L251bGwgfCBoZWFkIC0xIHx8IGVjaG8gQUJTRU5UKSIKICBlY2hvICJQWTM6ICQocHl0aG9uMyAtLXZlcnNpb24gMj4mMSkiCiAgZWNobyAiTlVNUFk6ICQocHl0aG9uMyAtYyAnaW1wb3J0IG51bXB5O3ByaW50KG51bXB5Ll9fdmVyc2lvbl9fKScgMj4mMSB8IHRhaWwgLTEpIgogIGVjaG8gIkNPTkRBOiAkKGxzIC1kIC9vcHQvY29uZGEgMj4vZGV2L251bGwgfHwgZWNobyBBQlNFTlQpIgogIGVjaG8gIkdTVVRJTDogJChjb21tYW5kIC12IGdzdXRpbCA+L2Rldi9udWxsIDI+JjEgJiYgKGdzdXRpbCB2ZXJzaW9uIDI+L2Rldi9udWxsIHwgaGVhZCAtMSkgfHwgZWNobyBBQlNFTlQpIgogIGVjaG8gIlNBOiAkKGN1cmwgLXMgLW0zIC1IICdNZXRhZGF0YS1GbGF2b3I6IEdvb2dsZScgaHR0cDovL21ldGFkYXRhLmdvb2dsZS5pbnRlcm5hbC9jb21wdXRlTWV0YWRhdGEvdjEvaW5zdGFuY2Uvc2VydmljZS1hY2NvdW50cy9kZWZhdWx0L2VtYWlsIDI+L2Rldi9udWxsIHx8IGVjaG8gTk9fTUVUQSkiCiAgZWNobyAiREZfUkFJRDogJChkZiAtaCAvbW50L3JhaWQgMj4vZGV2L251bGwgfCB0YWlsIC0xIHx8IGVjaG8gTk9UX01PVU5URUQpIgp9ID4gL3RtcC90NHAub3V0IDI+JjEKVj0iSE9TVD0kSCAkKGdyZXAgLUUgJ14oQ1BVX1JBTXxTU0RfREFUQXxQQ0lfR1BVfERFVk5PREVTfE5WSURJQV9TTUl8Q1VEQV9ESVJTfEtIRUFERVJTfEdDQ3xOVU1QWXxDT05EQXxHU1VUSUx8U0F8S0VSTkVMKScgL3RtcC90NHAub3V0IHwgdHIgJ1xuJyAnICcpIgpwb3N0ICIkViIKIyBzZWNvbmQsIFNIT1JUIHBvc3Qgc28gdGhlIHNpbmsncyB0YWlsLTUwMCBwcmludCBzaG93cyB0aGUgc2hhcGUtdHJ1dGggbGluZXMgKGNvbnNvbGUtY29zdCBhdWRpdCk6CkNPUkU9IkhPU1Q9JEggJChncmVwIC1FICdeKENQVV9SQU18R0NFX01UfFNTRF9EQVRBfFBDSV9HUFV8TlZJRElBX1NNSSknIC90bXAvdDRwLm91dCB8IHRyICdcbicgJyAnKSIKcG9zdCAiJHtDT1JFOjA6NDIwfSB8IFQ0UFJPQkVfRE9ORSIKZWNobyAiVDRQUk9CRV9ET05FIHBvc3RlZCIgPj4gL3RtcC90NHAub3V0Cg==").decode()\nFR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRwLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRwLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNFBfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRQX0xBVU5DSEVEICRIIFM9JFMiCi9iaW4vYmFzaCAvdG1wL3Byb2JlLWdwdS5zaCAgPj4gL3RtcC90NHAub3V0IDI+JjEKcG9zdCAiVDRQX0VYSVQgJEggcmM9JD8gdGFpbDogJCh0YWlsIC1jIDMwMCAvdG1wL3Q0cC5vdXQpIgo=").decode()\nMGRFQ = "localhost"\ndef __t4_launch():\n    h = socket.gethostname().split(".")[0]\n    open("/tmp/probe-gpu.sh", "w").write(PAY)\n    open("/tmp/t4p-fr.sh", "w").write(FR)\n    # RESOLVE bash, don\'t assume it: executors ARE host processes, so shutil.which("bash") here\n    # returns the host\'s own bash -> the exact file visible at /host<that path> once / is mounted.\n    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian\'s /bin/bash.\n    import shutil\n    _b = shutil.which("bash") or subprocess.run(\n        "find / -maxdepth 4 \\( -path /proc -o -path /sys -o -path /var/lib/docker \\) -prune "\n        "-o -name bash -type f -print 2>/dev/null | head -1",\n        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"\n    HB = "/host" + _b\n    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"\n                   " || tar -c --files-from /dev/null | docker import - emptyimg",\n                   shell=True, capture_output=True, timeout=60)\n    r = subprocess.run("docker run -d --name t4p-" + SFX + "-" + h +\n                       " --privileged --pid=host --uts=host --network=host --ipc=host "\n                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "\n                       + HB + " -c \'/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4p-fr.sh " + SFX + "\'",\n                       shell=True, capture_output=True, text=True)\n    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]\n\nif __name__ == "__main__":\n    SFX = os.environ.get("SFX", "x")\n    from pyspark.sql import SparkSession\n    sp = SparkSession.builder.appName("t4p").getOrCreate()\n    for x in sorted(set(sp.sparkContext.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):\n        print("WL:", x, flush=True)\n    sp.stop()\n'
+        open("/tmp/job_t4p.py", "w").write(JOB)
+        p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
+            "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
+            "/tmp/job_t4p.py"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            env=dict(os.environ, SFX=SFX))
+        for line in p.stdout:
+            l = line.rstrip()
+            if l.startswith("WL:"):
+                print(l[:250], flush=True)
+        print("spark-submit rc:", p.wait(), flush=True)
+    print(">>> SINK cell: expect T4PROBE_DONE from BOTH workers <<<", flush=True)
+```
+
+## C5 — setup/stripe (T4SETUP_DONE x2)  [cell_setup.txt]
+```python
+# === io_t4 paste cell: 00_ROOT_SETUP.sh (emptyimg+loader-mount docker-root channel; sink tag T4S) ===
+# Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
+# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
+# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then T4SETUP_DONE from BOTH workers in the SINK cell.
+# Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
+import subprocess, random, os, socket, time, base64
+def __preflight():
+    try:
+        s = socket.create_connection(("127.0.0.1", 18888), timeout=3)
+        body = b"pf-t4s"
+        head = ("POST /preflight-t4s HTTP/1.1\r\nHost: m\r\nContent-Length: "
+                + str(len(body)) + "\r\n\r\n").encode()
+        s.sendall(head + body)
+        return b"200" in s.recv(16)
+    except Exception:
+        return False
+PAY = base64.b64decode("IyEvYmluL2Jhc2gKIyBpb190NCAvIDAwX1JPT1RfU0VUVVAuc2gg4oCUIHJvb3Qtb24td29ya2VyIHNldHVwIGZvciB0aGUgdDQtaW8xIHN0cmlwZWQtYXJyYXktPlZSQU0gYmVuY2guCiMKIyBSVU4gQVM6IFJPT1Qgb24gZWFjaCBEYXRhcHJvYyB3b3JrZXIuIFRoZSBPTkxZIHByb3ZlbiB3YXkgdG8gZ2V0IHJvb3Qgb24gYSB3b3JrZXIgaXMgdGhlCiMgZG9ja2VyLXByaXZpbGVnZWQgKyBuc2VudGVyIGNoYW5uZWwgZHJpdmVuIGZyb20gdGhlIE1BTkFHRVIgbm90ZWJvb2sgKHBhc3RlIGNlbGwsIHNlZQojIFJVTkJPT0subWQ7IGNoYW5uZWwgcHJvdmVuIGluIHdvcmtiZW5jaC1jbGkvUkVQUk9EVUNFX2xpdmVzdHJpcC5tZCBCNC9CNywgUExBWUJPT0tfbGl2ZXN0cmlwLm1kOjEzMi0xMzgpLgojIFRoaXMgc2NyaXB0IG11c3QgYmUgcGFzdGVkIHZpYSBtYWtlX3Bhc3RlX2NlbGwucHkgMDBfUk9PVF9TRVRVUC5zaCAtPiBsYXVuY2hlciBjZWxsLgojCiMgQm9keSBhZGFwdGVkIFZFUkJBVElNIGluIHN0cnVjdHVyZSBmcm9tIHRoZSB2YWxpZGF0ZWQgVjggc3RyaXAgKFJFUFJPRFVDRV9saXZlc3RyaXAubWQ6NjQwLTY4NiwKIyBHUkVFTiAyMDI2LTA5LTI4IHNzZC1wbGFpbjEwKSwgd2l0aCB0aHJlZSBjaGFuZ2VzOgojICAgMS4gZGlzayBjb3VudCBwYXJhbWV0ZXJpemVkIChORElTVF9NSU4sIGV4cGVjdCAxNiBvbiB0NC1pbzE7IHNpemUgZmlsdGVyID4zNTBHIGtlZXBzIGJvb3QgZGlzayBvdXQpOwojICAgMi4gZG0tc3RyaXBlIHRhYmxlIGxlbmd0aCA9IFNaKk4gICh0aGUgdjMgbGVuZ3RoIGJ1ZyDigJQgdGFibGUgIjAgJFNaIiBnYXZlIGEgMzY5RyBhcnJheSDigJQgaXMKIyAgICAgIEZJWEVEIHNpbmNlIHY1OiBSRVBST0RVQ0VfbGl2ZXN0cmlwLm1kIGNpdGVzIFJFU1VMVFMubWQ6NDEwLTQxMzsgbmV2ZXIgcmVncmVzcyB0aGlzKTsKIyAgIDMuIGFkZGVkIEdQVS9weXRob24vR0NTIFBST0JFIHNlY3Rpb24gKHByaW50cyBldmVyeXRoaW5nIHRoZSBiZW5jaCBraXQgbmVlZHMgdG8ga25vdyBhYm91dAojICAgICAgdGhpcyBDVURBIGltYWdlOiBkcml2ZXIsIC91c3IvbG9jYWwvY3VkYSwgcHl0aG9uMywgdG9yY2gvY3VweS9rdmlraW8vbnVtcHksIGdzdXRpbCwgL29wdC9jb25kYSkuCiMKIyBIREZTL1lBUk4gaHlnaWVuZSBydWxlIChSRVNVTFRTLm1kOjQzMS00MzQgIkFEREVORFVNNCIsIFJFUFJPRFVDRSBnb2xkZW4gcnVsZSA2KToKIyAgIGNob3duIE9OTFkgdGhlIHN1YnRyZWVzICRtL2hhZG9vcC9kZnMgKGhkZnM6aGFkb29wKSBhbmQgJG0vaGFkb29wL3lhcm4gKHlhcm46eWFybik7CiMgICBORVZFUiBgY2hvd24gLVJgIG9uIHRoZSAvbW50L04gbW91bnRwb2ludCBpdHNlbGY7IG1vdW50cG9pbnQgc3RheXMgcm9vdDpyb290IDA3NTUuCiMgICBWaW9sYXRpbmcgaXQgPT4gTk0gVU5IRUFMVEhZIGxvY2FsLWRpcnMgPT4gUk0gMCByZXNvdXJjZXMgPT4gd29ya2VycyB1bnJlYWNoYWJsZSAocGxhaW41IGRpZWQpLgojCiMgSWRlbXBvdGVudDogc2tpcHMgc3RyaXAgaWYgL21udC9yYWlkIGFscmVhZHkgbW91bnRlZDsgZmxvY2sgZ3VhcmQ7IFBPU1RzIGV2ZXJ5IHBoYXNlIHRvIHRoZQojIG1hbmFnZXIgc2luayBsaXN0ZW5lciAoOjE4ODg4KSB3aGljaCBwcmludHMgbGl2ZSBpbnRvIHRoZSBub3RlYm9vay4KIwojIEVudiBrbm9iczogTkRJU1RfTUlOIChkZWZhdWx0IDE2KSAgU0lOS19QT1JUIChkZWZhdWx0IDE4ODg4KQoKZXhwb3J0IFBBVEg9L3Vzci9zYmluOi91c3IvYmluOi9zYmluOi9iaW4KZXhlYyA+PiAvdG1wL3ByZXAtdDQubG9nIDI+JjIKZXhlYyAyPiYxCnNldCAteApzaG9wdCAtcyBudWxsZ2xvYgoKSD0kKGhvc3RuYW1lKQpNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKTkRJU1RfTUlOPSR7TkRJU1RfTUlOOi0xNn0KU0lOS19QT1JUPSR7U0lOS19QT1JUOi0xODg4OH0KcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOiRTSU5LX1BPUlQvdDRzZXR1cC0kSCIgfHwgdHJ1ZTsgZWNobyAiTE9DQUwgJDEiOyB9CgpkYXRlOyBwb3N0ICJUNFNFVFVQX1NUQVJUICRIIgpleGVjIDk+L3RtcC90NHNldHVwLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNFNFVFVQX1NLSVBMT0NLICRIIjsgZXhpdCAwOyB9CgojIC0tLS0tLS0tLS0gMC4gYWxyZWFkeSBkb25lPyAtLS0tLS0tLS0tCmlmIG1vdW50cG9pbnQgLXEgL21udC9yYWlkOyB0aGVuCiAgcG9zdCAiVDRTRVRVUF9BTFJFQURZX01PVU5URUQgJEggJChkZiAtaCAvbW50L3JhaWQgfCB0YWlsIC0xKSIKZWxzZQogICMgLS0tLS0tLS0tLSAxLiBjYXB0dXJlIGN1cnJlbnQgL21udC8qIG1vdW50cyAoSERGUy9ZQVJOIGRhdGEgZGlycykgLS0tLS0tLS0tLQogIExESVJTPSQoY3V0IC1mMiAtZCcgJyAvcHJvYy9tb3VudHMgfCBncmVwICJeL21udC8iIHwgdHIgJ1xuJyAnICcpCiAgcG9zdCAiTERJUlMgJExESVJTIgoKICAjIC0tLS0tLS0tLS0gMi4gZGlzY292ZXIgdGhlIHJlYWwgU1NEcyAoc2l6ZSBmaWx0ZXIgPjM1MEc6IGJvb3QtZGlzay1wcm9vZiwgbWF5IGJlIHNkYikgLS0tLS0tLS0tLQogIERJU0tTPSIiCiAgZm9yIGIgaW4gL3N5cy9ibG9jay9zZCogL3N5cy9ibG9jay9udm1lKm4xOyBkbwogICAgUz0kKGNhdCAkYi9zaXplIDI+L2Rldi9udWxsKQogICAgaWYgWyAtbiAiJFMiIF0gJiYgWyAiJFMiIC1ndCA3MDAwMDAwMDAgXTsgdGhlbiBESVNLUz0iJERJU0tTIC9kZXYvJChiYXNlbmFtZSAkYikiOyBmaQogIGRvbmUKICBOPSQoZWNobyAkRElTS1MgfCB3YyAtdykKICBwb3N0ICJESVNLU19OPSROICRESVNLUyIKICBpZiBbICIkTiIgLWx0ICIkTkRJU1RfTUlOIiBdOyB0aGVuIHBvc3QgIlQ0U0VUVVBfRkFJTCBXQU5UXyR7TkRJU1RfTUlOfV9HT1RfJE4gJEgiOyBleGl0IDE7IGZpCiAgU1o9JChmb3IgZCBpbiAkRElTS1M7IGRvIGNhdCAvc3lzL2Jsb2NrLyQoYmFzZW5hbWUgJGQpL3NpemU7IGRvbmUgfCBzb3J0IC1uIHwgaGVhZCAtMSkKICBMRU49JCgoU1oqTikpCiAgcG9zdCAiU1o9JFNaIExFTj0kTEVOIChsZW5ndGggPSBTWipOLCB2MyBvbmUtZGlzay1sZW5ndGggYnVnIE1VU1QgTk9UIHJlZ3Jlc3M6IFJFU1VMVFMubWQ6NDEwLTQxMykiCgogICMgLS0tLS0tLS0tLSAzLiBzdG9wIHNlcnZpY2VzLCB1bm1vdW50IC0tLS0tLS0tLS0KICBzeXN0ZW1jdGwgc3RvcCBoYWRvb3AteWFybi1ub2RlbWFuYWdlciBoYWRvb3AtaGRmcy1kYXRhbm9kZSAyPiYxOyBzbGVlcCAzCiAgZm9yIG0gaW4gJExESVJTOyBkbyB1bW91bnQgLWwgJG07IGRvbmUKICBzbGVlcCAyCiAgcG9zdCAiU0VSVklDRVNfU1RPUFBFRCIKCiAgIyAtLS0tLS0tLS0tIDQuIGRtLXN0cmlwZSBhbGwgTiBkaXNrcyAtLS0tLS0tLS0tCiAgbW9kcHJvYmUgZG0tc3RyaXBlIDI+JjEgICAjIGJlbmlnbiAiTW9kdWxlIG5vdCBmb3VuZCIgb24gdGhlc2Uga2VybmVsczogYnVpbHQtaW4sIGRtc2V0dXAgd29ya3MgYW55d2F5CiAgQVJHUz0iIjsgZm9yIGQgaW4gJERJU0tTOyBkbyBBUkdTPSIkQVJHUyAkZCAwIjsgZG9uZQogIE9LPSIiCiAgZm9yIFQgaW4gc3RyaXBlZCBzdHJpcGU7IGRvCiAgICBkbXNldHVwIGNyZWF0ZSBzc2RyYWlkIC0tdGFibGUgIjAgJExFTiAkVCAkTiAyNTYgJEFSR1MiICYmIHsgcG9zdCAiRE1fT0s9JFQiOyBPSz0xOyBicmVhazsgfQogICAgZG1zZXR1cCByZW1vdmUgc3NkcmFpZCAyPi9kZXYvbnVsbAogIGRvbmUKICBpZiBbIC16ICIkT0siIF0gfHwgISBkbXNldHVwIGluZm8gc3NkcmFpZCA+L2Rldi9udWxsIDI+JjE7IHRoZW4gcG9zdCAiVDRTRVRVUF9GQUlMIERNX0ZBSUwgJEgiOyBleGl0IDE7IGZpCgogICMgLS0tLS0tLS0tLSA1LiBta2ZzICsgbW91bnQsIHdpdGggYSAxMHMgaGVhcnRiZWF0IGFjcm9zcyB0aGUgd2hvbGUgbWtmcyAoYmVuY2htYXJrIGNlbGwgcnVsZSkgLS0tLS0tLS0tLQogIHBvc3QgIk1LRlNfQkVHSU4gJChkYXRlICslVCkiCiAgdDA9JChkYXRlICslcykKICBta2ZzLmV4dDQgLUYgLXEgL2Rldi9tYXBwZXIvc3NkcmFpZCAmIG1rcGlkPSQhCiAgKCB3aGlsZSBraWxsIC0wICRta3BpZCAyPi9kZXYvbnVsbDsgZG8gc2xlZXAgMTA7IHBvc3QgIk1LRlMgJCgoICQoZGF0ZSArJXMpLXQwICkpcyAuLi4iOyBkb25lICkgJiBtb249JCEKICB3YWl0ICRta3BpZDsgbXJjPSQ/CiAga2lsbCAkbW9uIDI+L2Rldi9udWxsCiAgcG9zdCAiTUtGU19ET05FIHJjPSRtcmMgJCgoICQoZGF0ZSArJXMpLXQwICkpcyIKICBbICRtcmMgLW5lIDAgXSAmJiB7IHBvc3QgIlQ0U0VUVVBfRkFJTCBNS0ZTIHJjPSRtcmMiOyBleGl0IDE7IH0KICBta2RpciAtcCAvbW50L3JhaWQgJiYgbW91bnQgL2Rldi9tYXBwZXIvc3NkcmFpZCAvbW50L3JhaWQgJiYgY2htb2QgMTc3NyAvbW50L3JhaWQKICBwb3N0ICJNT1VOVEVEICQoZGYgLWggL21udC9yYWlkIHwgdGFpbCAtMSkiCmZpCgojIC0tLS0tLS0tLS0gNi4gSERGUy9ZQVJOIGRpcnM6IHJlY3JlYXRlICsgY2hvd24gU1VCVFJFRVMgT05MWSwgbW91bnRwb2ludCByb290OnJvb3QgMDc1NSAtLS0tLS0tLS0tCmZvciBtIGluICRMRElSUzsgZG8KICBta2RpciAtcCAkbS9oYWRvb3AvZGZzL2RhdGEgJG0vaGFkb29wL3lhcm4vbm0tbG9jYWwtZGlyCiAgY2hvd24gLVIgaGRmczpoYWRvb3AgJG0vaGFkb29wL2RmcwogIGNob3duIC1SIHlhcm46eWFybiAkbS9oYWRvb3AveWFybgogIGNob3duIHJvb3Q6cm9vdCAkbTsgY2htb2QgMDc1NSAkbQpkb25lCnBvc3QgIkRJUlNfRklYRUQiCnN5c3RlbWN0bCByZXN0YXJ0IGhhZG9vcC1oZGZzLWRhdGFub2RlIDI+JjEgfHwgdHJ1ZQpzeXN0ZW1jdGwgcmVzdGFydCBoYWRvb3AteWFybi1ub2RlbWFuYWdlciAyPiYxIHx8IHRydWUKc2xlZXAgMTUKcG9zdCAiRE49JChzeXN0ZW1jdGwgaXMtYWN0aXZlIGhhZG9vcC1oZGZzLWRhdGFub2RlIDI+JjEpIE5NPSQoc3lzdGVtY3RsIGlzLWFjdGl2ZSBoYWRvb3AteWFybi1ub2RlbWFuYWdlciAyPiYxKSIKCiMgLS0tLS0tLS0tLSA3LiBQUk9CRSBzZWN0aW9uIChwcmludC1vbmx5OyBldmVyeSBsaW5lIHBvc3RlZCBzZXBhcmF0ZWx5IOKAlCBzaW5rIHByaW50cyB0YWlscykgLS0tLS0tLS0tLQp7CiAgZWNobyAiPT0gR1BVID09IgogIG52aWRpYS1zbWkgMj4mMSB8IGhlYWQgLTE1IHx8IGVjaG8gIk5PIG52aWRpYS1zbWkgaW4gUEFUSCIKICBlY2hvICJkcml2ZXJfdmVyc2lvbj0kKGNhdCAvc3lzL21vZHVsZS9udmlkaWEvdmVyc2lvbiAyPi9kZXYvbnVsbCB8fCBlY2hvIG5vbmUpIgogIGxzIC1kIC91c3IvbG9jYWwvY3VkYSogMj4vZGV2L251bGwgfHwgZWNobyAibm8gL3Vzci9sb2NhbC9jdWRhKiIKICAvdXNyL2xvY2FsL2N1ZGEvYmluL252Y2MgLS12ZXJzaW9uIDI+L2Rldi9udWxsIHwgdGFpbCAtMiB8fCBlY2hvICJubyBudmNjIgogIGxzIC9kZXYvbnZpZGlhKiAyPi9kZXYvbnVsbCB8fCBlY2hvICJubyAvZGV2L252aWRpYSoiCiAgbGRjb25maWcgLXAgMj4vZGV2L251bGwgfCBncmVwIC1FICJsaWJjdWRhcnR8bGliY3VkYVwuc28iIHwgaGVhZCAtNgogIGVjaG8gIj09IFBZVEhPTiA9PSIKICB3aGljaCBweXRob24zOyBweXRob24zIC0tdmVyc2lvbgogIGxzIC1kIC9vcHQvY29uZGEgMj4vZGV2L251bGwgJiYgbHMgL29wdC9jb25kYSAyPi9kZXYvbnVsbCB8IGhlYWQgLTggfHwgZWNobyAibm8gL29wdC9jb25kYSIKICBmb3IgbW9kIGluIG51bXB5IHRvcmNoIGN1cHkga3Zpa2lvOyBkbwogICAgcHl0aG9uMyAtYyAiaW1wb3J0ICRtb2Q7IHByaW50KCckbW9kJywgZ2V0YXR0cigkbW9kLCdfX3ZlcnNpb25fXycsJz8nKSkiIDI+L2Rldi9udWxsIHx8IGVjaG8gIiRtb2QgPSBOT1QgaW1wb3J0YWJsZSIKICBkb25lCiAgZWNobyAiPT0gR0NTL0NMSSA9PSIKICB3aGljaCBnc3V0aWwgJiYgZ3N1dGlsIHZlcnNpb24gMj4mMSB8IGhlYWQgLTEgfHwgZWNobyAibm8gZ3N1dGlsIgogIHdoaWNoIGdjbG91ZCAmJiBnY2xvdWQgdmVyc2lvbiAyPiYxIHwgaGVhZCAtMiB8fCBlY2hvICJubyBnY2xvdWQiCiAgVE9LPSQoY3VybCAtcyAtbTUgLUggIk1ldGFkYXRhLUZsYXZvcjogR29vZ2xlIiAiaHR0cDovL21ldGFkYXRhLmdvb2dsZS5pbnRlcm5hbC9jb21wdXRlTWV0YWRhdGEvdjEvaW5zdGFuY2Uvc2VydmljZS1hY2NvdW50cy9kZWZhdWx0L2VtYWlsIiAyPi9kZXYvbnVsbCkKICBlY2hvICJTQV9lbWFpbD0ke1RPSzotbWV0YWRhdGEtdW5yZWFjaGFibGV9IgogIGVjaG8gIj09IE1JU0MgPT0iCiAgZWNobyAicHl0aG9uX3BpcD0kKHB5dGhvbjMgLW0gcGlwIC0tdmVyc2lvbiAyPi9kZXYvbnVsbCB8fCBlY2hvIG5vLXBpcCkiCiAgZWNobyAiZHJvcF9jYWNoZXM9JChbIC13IC9wcm9jL3N5cy92bS9kcm9wX2NhY2hlcyBdICYmIGVjaG8gd3JpdGFibGUtcm9vdCB8fCBlY2hvIG5vdC13cml0YWJsZSkiCiAgZWNobyAiZG9ja2VyPSQoZG9ja2VyIGluZm8gLS1mb3JtYXQgJ3t7LlNlcnZlclZlcnNpb259fScgMj4vZGV2L251bGwgfHwgZWNobyBuby1kb2NrZXItc29ja2V0KSIKICBmcmVlIC1nIHwgaGVhZCAtMgogIGRmIC1oIC9tbnQvcmFpZCB8IHRhaWwgLTEKfSA+IC90bXAvdDRwcm9iZS5sb2cgMj4mMQojIHBvc3QgcHJvYmUgbGluZS1ieS1saW5lIChzaW5rIGhhbmRsZXIgcHJpbnRzIHRoZSB0YWlsIG9mIHRoZSBMQVNUIHBvc3QgcGVyIHBhdGgpCndoaWxlIElGUz0gcmVhZCAtciBsaW5lOyBkbyBwb3N0ICJQUk9CRSB8ICRsaW5lIjsgZG9uZSA8IC90bXAvdDRwcm9iZS5sb2cKcG9zdCAiUFJPQkVfRlVMTF9UQUlMOiAkKHRhaWwgLWMgNDUwIC90bXAvdDRwcm9iZS5sb2cpIgoKcG9zdCAiVDRTRVRVUF9ET05FICRIIgplY2hvIFZfRE9ORTsgZGF0ZQo=").decode()
+FR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRzLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRzLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNFNfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRTX0xBVU5DSEVEICRIIFM9JFMiCi9iaW4vYmFzaCAvdG1wL3NldHVwLXQ0LnNoICA+PiAvdG1wL3Q0cy5vdXQgMj4mMQpwb3N0ICJUNFNfRVhJVCAkSCByYz0kPyB0YWlsOiAkKHRhaWwgLWMgMzAwIC90bXAvdDRzLm91dCkiCg==").decode()
+SFX = "%04x" % random.randrange(65536)
+_fq = socket.getfqdn()
+if "." not in _fq:
+    _d = subprocess.run("hostname -d", shell=True, capture_output=True, text=True).stdout.strip()
+    _fq = socket.gethostname().split(".")[0] + "." + _d if _d else socket.gethostname().split(".")[0]
+MGRFQ = _fq
+def __t4_launch():
+    h = socket.gethostname().split(".")[0]
+    open("/tmp/setup-t4.sh", "w").write(PAY)
+    open("/tmp/t4s-fr.sh", "w").write(FR)
+    # RESOLVE bash, don't assume it: executors ARE host processes, so shutil.which("bash") here
+    # returns the host's own bash -> the exact file visible at /host<that path> once / is mounted.
+    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian's /bin/bash.
+    import shutil
+    _b = shutil.which("bash") or subprocess.run(
+        "find / -maxdepth 4 \( -path /proc -o -path /sys -o -path /var/lib/docker \) -prune "
+        "-o -name bash -type f -print 2>/dev/null | head -1",
+        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"
+    HB = "/host" + _b
+    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"
+                   " || tar -c --files-from /dev/null | docker import - emptyimg",
+                   shell=True, capture_output=True, timeout=60)
+    r = subprocess.run("docker run -d --name t4s-" + SFX + "-" + h +
+                       " --privileged --pid=host --uts=host --network=host --ipc=host "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "
+                       + HB + " -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4s-fr.sh " + SFX + "'",
+                       shell=True, capture_output=True, text=True)
+    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]
+
+if not __preflight():
+    print("PREFLIGHT FAIL: sink not answering on :18888 -> restart kernel, run this file from C0.", flush=True)
+else:
+    print("PREFLIGHT_OK sink alive", time.strftime("%H:%M:%S"), flush=True)
+    __sc = globals().get("sc")
+    __live = False
+    if __sc is not None:
+        try:
+            __live = (__sc.parallelize([1], 1).count() == 1)
+        except Exception:
+            __live = False
+    if __live:
+        print("MODE: session", flush=True)
+        for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
+            print("WL:", x[:250], flush=True)
+    else:
+        print("MODE: spark-submit fallback (no live session -> if AFTER C2, contract broken: restart kernel, run from C0; costs 1-3 min)", flush=True)
+        JOB = 'import base64, socket, subprocess, os\nPAY = base64.b64decode("IyEvYmluL2Jhc2gKIyBpb190NCAvIDAwX1JPT1RfU0VUVVAuc2gg4oCUIHJvb3Qtb24td29ya2VyIHNldHVwIGZvciB0aGUgdDQtaW8xIHN0cmlwZWQtYXJyYXktPlZSQU0gYmVuY2guCiMKIyBSVU4gQVM6IFJPT1Qgb24gZWFjaCBEYXRhcHJvYyB3b3JrZXIuIFRoZSBPTkxZIHByb3ZlbiB3YXkgdG8gZ2V0IHJvb3Qgb24gYSB3b3JrZXIgaXMgdGhlCiMgZG9ja2VyLXByaXZpbGVnZWQgKyBuc2VudGVyIGNoYW5uZWwgZHJpdmVuIGZyb20gdGhlIE1BTkFHRVIgbm90ZWJvb2sgKHBhc3RlIGNlbGwsIHNlZQojIFJVTkJPT0subWQ7IGNoYW5uZWwgcHJvdmVuIGluIHdvcmtiZW5jaC1jbGkvUkVQUk9EVUNFX2xpdmVzdHJpcC5tZCBCNC9CNywgUExBWUJPT0tfbGl2ZXN0cmlwLm1kOjEzMi0xMzgpLgojIFRoaXMgc2NyaXB0IG11c3QgYmUgcGFzdGVkIHZpYSBtYWtlX3Bhc3RlX2NlbGwucHkgMDBfUk9PVF9TRVRVUC5zaCAtPiBsYXVuY2hlciBjZWxsLgojCiMgQm9keSBhZGFwdGVkIFZFUkJBVElNIGluIHN0cnVjdHVyZSBmcm9tIHRoZSB2YWxpZGF0ZWQgVjggc3RyaXAgKFJFUFJPRFVDRV9saXZlc3RyaXAubWQ6NjQwLTY4NiwKIyBHUkVFTiAyMDI2LTA5LTI4IHNzZC1wbGFpbjEwKSwgd2l0aCB0aHJlZSBjaGFuZ2VzOgojICAgMS4gZGlzayBjb3VudCBwYXJhbWV0ZXJpemVkIChORElTVF9NSU4sIGV4cGVjdCAxNiBvbiB0NC1pbzE7IHNpemUgZmlsdGVyID4zNTBHIGtlZXBzIGJvb3QgZGlzayBvdXQpOwojICAgMi4gZG0tc3RyaXBlIHRhYmxlIGxlbmd0aCA9IFNaKk4gICh0aGUgdjMgbGVuZ3RoIGJ1ZyDigJQgdGFibGUgIjAgJFNaIiBnYXZlIGEgMzY5RyBhcnJheSDigJQgaXMKIyAgICAgIEZJWEVEIHNpbmNlIHY1OiBSRVBST0RVQ0VfbGl2ZXN0cmlwLm1kIGNpdGVzIFJFU1VMVFMubWQ6NDEwLTQxMzsgbmV2ZXIgcmVncmVzcyB0aGlzKTsKIyAgIDMuIGFkZGVkIEdQVS9weXRob24vR0NTIFBST0JFIHNlY3Rpb24gKHByaW50cyBldmVyeXRoaW5nIHRoZSBiZW5jaCBraXQgbmVlZHMgdG8ga25vdyBhYm91dAojICAgICAgdGhpcyBDVURBIGltYWdlOiBkcml2ZXIsIC91c3IvbG9jYWwvY3VkYSwgcHl0aG9uMywgdG9yY2gvY3VweS9rdmlraW8vbnVtcHksIGdzdXRpbCwgL29wdC9jb25kYSkuCiMKIyBIREZTL1lBUk4gaHlnaWVuZSBydWxlIChSRVNVTFRTLm1kOjQzMS00MzQgIkFEREVORFVNNCIsIFJFUFJPRFVDRSBnb2xkZW4gcnVsZSA2KToKIyAgIGNob3duIE9OTFkgdGhlIHN1YnRyZWVzICRtL2hhZG9vcC9kZnMgKGhkZnM6aGFkb29wKSBhbmQgJG0vaGFkb29wL3lhcm4gKHlhcm46eWFybik7CiMgICBORVZFUiBgY2hvd24gLVJgIG9uIHRoZSAvbW50L04gbW91bnRwb2ludCBpdHNlbGY7IG1vdW50cG9pbnQgc3RheXMgcm9vdDpyb290IDA3NTUuCiMgICBWaW9sYXRpbmcgaXQgPT4gTk0gVU5IRUFMVEhZIGxvY2FsLWRpcnMgPT4gUk0gMCByZXNvdXJjZXMgPT4gd29ya2VycyB1bnJlYWNoYWJsZSAocGxhaW41IGRpZWQpLgojCiMgSWRlbXBvdGVudDogc2tpcHMgc3RyaXAgaWYgL21udC9yYWlkIGFscmVhZHkgbW91bnRlZDsgZmxvY2sgZ3VhcmQ7IFBPU1RzIGV2ZXJ5IHBoYXNlIHRvIHRoZQojIG1hbmFnZXIgc2luayBsaXN0ZW5lciAoOjE4ODg4KSB3aGljaCBwcmludHMgbGl2ZSBpbnRvIHRoZSBub3RlYm9vay4KIwojIEVudiBrbm9iczogTkRJU1RfTUlOIChkZWZhdWx0IDE2KSAgU0lOS19QT1JUIChkZWZhdWx0IDE4ODg4KQoKZXhwb3J0IFBBVEg9L3Vzci9zYmluOi91c3IvYmluOi9zYmluOi9iaW4KZXhlYyA+PiAvdG1wL3ByZXAtdDQubG9nIDI+JjIKZXhlYyAyPiYxCnNldCAteApzaG9wdCAtcyBudWxsZ2xvYgoKSD0kKGhvc3RuYW1lKQpNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKTkRJU1RfTUlOPSR7TkRJU1RfTUlOOi0xNn0KU0lOS19QT1JUPSR7U0lOS19QT1JUOi0xODg4OH0KcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOiRTSU5LX1BPUlQvdDRzZXR1cC0kSCIgfHwgdHJ1ZTsgZWNobyAiTE9DQUwgJDEiOyB9CgpkYXRlOyBwb3N0ICJUNFNFVFVQX1NUQVJUICRIIgpleGVjIDk+L3RtcC90NHNldHVwLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNFNFVFVQX1NLSVBMT0NLICRIIjsgZXhpdCAwOyB9CgojIC0tLS0tLS0tLS0gMC4gYWxyZWFkeSBkb25lPyAtLS0tLS0tLS0tCmlmIG1vdW50cG9pbnQgLXEgL21udC9yYWlkOyB0aGVuCiAgcG9zdCAiVDRTRVRVUF9BTFJFQURZX01PVU5URUQgJEggJChkZiAtaCAvbW50L3JhaWQgfCB0YWlsIC0xKSIKZWxzZQogICMgLS0tLS0tLS0tLSAxLiBjYXB0dXJlIGN1cnJlbnQgL21udC8qIG1vdW50cyAoSERGUy9ZQVJOIGRhdGEgZGlycykgLS0tLS0tLS0tLQogIExESVJTPSQoY3V0IC1mMiAtZCcgJyAvcHJvYy9tb3VudHMgfCBncmVwICJeL21udC8iIHwgdHIgJ1xuJyAnICcpCiAgcG9zdCAiTERJUlMgJExESVJTIgoKICAjIC0tLS0tLS0tLS0gMi4gZGlzY292ZXIgdGhlIHJlYWwgU1NEcyAoc2l6ZSBmaWx0ZXIgPjM1MEc6IGJvb3QtZGlzay1wcm9vZiwgbWF5IGJlIHNkYikgLS0tLS0tLS0tLQogIERJU0tTPSIiCiAgZm9yIGIgaW4gL3N5cy9ibG9jay9zZCogL3N5cy9ibG9jay9udm1lKm4xOyBkbwogICAgUz0kKGNhdCAkYi9zaXplIDI+L2Rldi9udWxsKQogICAgaWYgWyAtbiAiJFMiIF0gJiYgWyAiJFMiIC1ndCA3MDAwMDAwMDAgXTsgdGhlbiBESVNLUz0iJERJU0tTIC9kZXYvJChiYXNlbmFtZSAkYikiOyBmaQogIGRvbmUKICBOPSQoZWNobyAkRElTS1MgfCB3YyAtdykKICBwb3N0ICJESVNLU19OPSROICRESVNLUyIKICBpZiBbICIkTiIgLWx0ICIkTkRJU1RfTUlOIiBdOyB0aGVuIHBvc3QgIlQ0U0VUVVBfRkFJTCBXQU5UXyR7TkRJU1RfTUlOfV9HT1RfJE4gJEgiOyBleGl0IDE7IGZpCiAgU1o9JChmb3IgZCBpbiAkRElTS1M7IGRvIGNhdCAvc3lzL2Jsb2NrLyQoYmFzZW5hbWUgJGQpL3NpemU7IGRvbmUgfCBzb3J0IC1uIHwgaGVhZCAtMSkKICBMRU49JCgoU1oqTikpCiAgcG9zdCAiU1o9JFNaIExFTj0kTEVOIChsZW5ndGggPSBTWipOLCB2MyBvbmUtZGlzay1sZW5ndGggYnVnIE1VU1QgTk9UIHJlZ3Jlc3M6IFJFU1VMVFMubWQ6NDEwLTQxMykiCgogICMgLS0tLS0tLS0tLSAzLiBzdG9wIHNlcnZpY2VzLCB1bm1vdW50IC0tLS0tLS0tLS0KICBzeXN0ZW1jdGwgc3RvcCBoYWRvb3AteWFybi1ub2RlbWFuYWdlciBoYWRvb3AtaGRmcy1kYXRhbm9kZSAyPiYxOyBzbGVlcCAzCiAgZm9yIG0gaW4gJExESVJTOyBkbyB1bW91bnQgLWwgJG07IGRvbmUKICBzbGVlcCAyCiAgcG9zdCAiU0VSVklDRVNfU1RPUFBFRCIKCiAgIyAtLS0tLS0tLS0tIDQuIGRtLXN0cmlwZSBhbGwgTiBkaXNrcyAtLS0tLS0tLS0tCiAgbW9kcHJvYmUgZG0tc3RyaXBlIDI+JjEgICAjIGJlbmlnbiAiTW9kdWxlIG5vdCBmb3VuZCIgb24gdGhlc2Uga2VybmVsczogYnVpbHQtaW4sIGRtc2V0dXAgd29ya3MgYW55d2F5CiAgQVJHUz0iIjsgZm9yIGQgaW4gJERJU0tTOyBkbyBBUkdTPSIkQVJHUyAkZCAwIjsgZG9uZQogIE9LPSIiCiAgZm9yIFQgaW4gc3RyaXBlZCBzdHJpcGU7IGRvCiAgICBkbXNldHVwIGNyZWF0ZSBzc2RyYWlkIC0tdGFibGUgIjAgJExFTiAkVCAkTiAyNTYgJEFSR1MiICYmIHsgcG9zdCAiRE1fT0s9JFQiOyBPSz0xOyBicmVhazsgfQogICAgZG1zZXR1cCByZW1vdmUgc3NkcmFpZCAyPi9kZXYvbnVsbAogIGRvbmUKICBpZiBbIC16ICIkT0siIF0gfHwgISBkbXNldHVwIGluZm8gc3NkcmFpZCA+L2Rldi9udWxsIDI+JjE7IHRoZW4gcG9zdCAiVDRTRVRVUF9GQUlMIERNX0ZBSUwgJEgiOyBleGl0IDE7IGZpCgogICMgLS0tLS0tLS0tLSA1LiBta2ZzICsgbW91bnQsIHdpdGggYSAxMHMgaGVhcnRiZWF0IGFjcm9zcyB0aGUgd2hvbGUgbWtmcyAoYmVuY2htYXJrIGNlbGwgcnVsZSkgLS0tLS0tLS0tLQogIHBvc3QgIk1LRlNfQkVHSU4gJChkYXRlICslVCkiCiAgdDA9JChkYXRlICslcykKICBta2ZzLmV4dDQgLUYgLXEgL2Rldi9tYXBwZXIvc3NkcmFpZCAmIG1rcGlkPSQhCiAgKCB3aGlsZSBraWxsIC0wICRta3BpZCAyPi9kZXYvbnVsbDsgZG8gc2xlZXAgMTA7IHBvc3QgIk1LRlMgJCgoICQoZGF0ZSArJXMpLXQwICkpcyAuLi4iOyBkb25lICkgJiBtb249JCEKICB3YWl0ICRta3BpZDsgbXJjPSQ/CiAga2lsbCAkbW9uIDI+L2Rldi9udWxsCiAgcG9zdCAiTUtGU19ET05FIHJjPSRtcmMgJCgoICQoZGF0ZSArJXMpLXQwICkpcyIKICBbICRtcmMgLW5lIDAgXSAmJiB7IHBvc3QgIlQ0U0VUVVBfRkFJTCBNS0ZTIHJjPSRtcmMiOyBleGl0IDE7IH0KICBta2RpciAtcCAvbW50L3JhaWQgJiYgbW91bnQgL2Rldi9tYXBwZXIvc3NkcmFpZCAvbW50L3JhaWQgJiYgY2htb2QgMTc3NyAvbW50L3JhaWQKICBwb3N0ICJNT1VOVEVEICQoZGYgLWggL21udC9yYWlkIHwgdGFpbCAtMSkiCmZpCgojIC0tLS0tLS0tLS0gNi4gSERGUy9ZQVJOIGRpcnM6IHJlY3JlYXRlICsgY2hvd24gU1VCVFJFRVMgT05MWSwgbW91bnRwb2ludCByb290OnJvb3QgMDc1NSAtLS0tLS0tLS0tCmZvciBtIGluICRMRElSUzsgZG8KICBta2RpciAtcCAkbS9oYWRvb3AvZGZzL2RhdGEgJG0vaGFkb29wL3lhcm4vbm0tbG9jYWwtZGlyCiAgY2hvd24gLVIgaGRmczpoYWRvb3AgJG0vaGFkb29wL2RmcwogIGNob3duIC1SIHlhcm46eWFybiAkbS9oYWRvb3AveWFybgogIGNob3duIHJvb3Q6cm9vdCAkbTsgY2htb2QgMDc1NSAkbQpkb25lCnBvc3QgIkRJUlNfRklYRUQiCnN5c3RlbWN0bCByZXN0YXJ0IGhhZG9vcC1oZGZzLWRhdGFub2RlIDI+JjEgfHwgdHJ1ZQpzeXN0ZW1jdGwgcmVzdGFydCBoYWRvb3AteWFybi1ub2RlbWFuYWdlciAyPiYxIHx8IHRydWUKc2xlZXAgMTUKcG9zdCAiRE49JChzeXN0ZW1jdGwgaXMtYWN0aXZlIGhhZG9vcC1oZGZzLWRhdGFub2RlIDI+JjEpIE5NPSQoc3lzdGVtY3RsIGlzLWFjdGl2ZSBoYWRvb3AteWFybi1ub2RlbWFuYWdlciAyPiYxKSIKCiMgLS0tLS0tLS0tLSA3LiBQUk9CRSBzZWN0aW9uIChwcmludC1vbmx5OyBldmVyeSBsaW5lIHBvc3RlZCBzZXBhcmF0ZWx5IOKAlCBzaW5rIHByaW50cyB0YWlscykgLS0tLS0tLS0tLQp7CiAgZWNobyAiPT0gR1BVID09IgogIG52aWRpYS1zbWkgMj4mMSB8IGhlYWQgLTE1IHx8IGVjaG8gIk5PIG52aWRpYS1zbWkgaW4gUEFUSCIKICBlY2hvICJkcml2ZXJfdmVyc2lvbj0kKGNhdCAvc3lzL21vZHVsZS9udmlkaWEvdmVyc2lvbiAyPi9kZXYvbnVsbCB8fCBlY2hvIG5vbmUpIgogIGxzIC1kIC91c3IvbG9jYWwvY3VkYSogMj4vZGV2L251bGwgfHwgZWNobyAibm8gL3Vzci9sb2NhbC9jdWRhKiIKICAvdXNyL2xvY2FsL2N1ZGEvYmluL252Y2MgLS12ZXJzaW9uIDI+L2Rldi9udWxsIHwgdGFpbCAtMiB8fCBlY2hvICJubyBudmNjIgogIGxzIC9kZXYvbnZpZGlhKiAyPi9kZXYvbnVsbCB8fCBlY2hvICJubyAvZGV2L252aWRpYSoiCiAgbGRjb25maWcgLXAgMj4vZGV2L251bGwgfCBncmVwIC1FICJsaWJjdWRhcnR8bGliY3VkYVwuc28iIHwgaGVhZCAtNgogIGVjaG8gIj09IFBZVEhPTiA9PSIKICB3aGljaCBweXRob24zOyBweXRob24zIC0tdmVyc2lvbgogIGxzIC1kIC9vcHQvY29uZGEgMj4vZGV2L251bGwgJiYgbHMgL29wdC9jb25kYSAyPi9kZXYvbnVsbCB8IGhlYWQgLTggfHwgZWNobyAibm8gL29wdC9jb25kYSIKICBmb3IgbW9kIGluIG51bXB5IHRvcmNoIGN1cHkga3Zpa2lvOyBkbwogICAgcHl0aG9uMyAtYyAiaW1wb3J0ICRtb2Q7IHByaW50KCckbW9kJywgZ2V0YXR0cigkbW9kLCdfX3ZlcnNpb25fXycsJz8nKSkiIDI+L2Rldi9udWxsIHx8IGVjaG8gIiRtb2QgPSBOT1QgaW1wb3J0YWJsZSIKICBkb25lCiAgZWNobyAiPT0gR0NTL0NMSSA9PSIKICB3aGljaCBnc3V0aWwgJiYgZ3N1dGlsIHZlcnNpb24gMj4mMSB8IGhlYWQgLTEgfHwgZWNobyAibm8gZ3N1dGlsIgogIHdoaWNoIGdjbG91ZCAmJiBnY2xvdWQgdmVyc2lvbiAyPiYxIHwgaGVhZCAtMiB8fCBlY2hvICJubyBnY2xvdWQiCiAgVE9LPSQoY3VybCAtcyAtbTUgLUggIk1ldGFkYXRhLUZsYXZvcjogR29vZ2xlIiAiaHR0cDovL21ldGFkYXRhLmdvb2dsZS5pbnRlcm5hbC9jb21wdXRlTWV0YWRhdGEvdjEvaW5zdGFuY2Uvc2VydmljZS1hY2NvdW50cy9kZWZhdWx0L2VtYWlsIiAyPi9kZXYvbnVsbCkKICBlY2hvICJTQV9lbWFpbD0ke1RPSzotbWV0YWRhdGEtdW5yZWFjaGFibGV9IgogIGVjaG8gIj09IE1JU0MgPT0iCiAgZWNobyAicHl0aG9uX3BpcD0kKHB5dGhvbjMgLW0gcGlwIC0tdmVyc2lvbiAyPi9kZXYvbnVsbCB8fCBlY2hvIG5vLXBpcCkiCiAgZWNobyAiZHJvcF9jYWNoZXM9JChbIC13IC9wcm9jL3N5cy92bS9kcm9wX2NhY2hlcyBdICYmIGVjaG8gd3JpdGFibGUtcm9vdCB8fCBlY2hvIG5vdC13cml0YWJsZSkiCiAgZWNobyAiZG9ja2VyPSQoZG9ja2VyIGluZm8gLS1mb3JtYXQgJ3t7LlNlcnZlclZlcnNpb259fScgMj4vZGV2L251bGwgfHwgZWNobyBuby1kb2NrZXItc29ja2V0KSIKICBmcmVlIC1nIHwgaGVhZCAtMgogIGRmIC1oIC9tbnQvcmFpZCB8IHRhaWwgLTEKfSA+IC90bXAvdDRwcm9iZS5sb2cgMj4mMQojIHBvc3QgcHJvYmUgbGluZS1ieS1saW5lIChzaW5rIGhhbmRsZXIgcHJpbnRzIHRoZSB0YWlsIG9mIHRoZSBMQVNUIHBvc3QgcGVyIHBhdGgpCndoaWxlIElGUz0gcmVhZCAtciBsaW5lOyBkbyBwb3N0ICJQUk9CRSB8ICRsaW5lIjsgZG9uZSA8IC90bXAvdDRwcm9iZS5sb2cKcG9zdCAiUFJPQkVfRlVMTF9UQUlMOiAkKHRhaWwgLWMgNDUwIC90bXAvdDRwcm9iZS5sb2cpIgoKcG9zdCAiVDRTRVRVUF9ET05FICRIIgplY2hvIFZfRE9ORTsgZGF0ZQo=").decode()\nFR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRzLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRzLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNFNfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRTX0xBVU5DSEVEICRIIFM9JFMiCi9iaW4vYmFzaCAvdG1wL3NldHVwLXQ0LnNoICA+PiAvdG1wL3Q0cy5vdXQgMj4mMQpwb3N0ICJUNFNfRVhJVCAkSCByYz0kPyB0YWlsOiAkKHRhaWwgLWMgMzAwIC90bXAvdDRzLm91dCkiCg==").decode()\nMGRFQ = "localhost"\ndef __t4_launch():\n    h = socket.gethostname().split(".")[0]\n    open("/tmp/setup-t4.sh", "w").write(PAY)\n    open("/tmp/t4s-fr.sh", "w").write(FR)\n    # RESOLVE bash, don\'t assume it: executors ARE host processes, so shutil.which("bash") here\n    # returns the host\'s own bash -> the exact file visible at /host<that path> once / is mounted.\n    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian\'s /bin/bash.\n    import shutil\n    _b = shutil.which("bash") or subprocess.run(\n        "find / -maxdepth 4 \\( -path /proc -o -path /sys -o -path /var/lib/docker \\) -prune "\n        "-o -name bash -type f -print 2>/dev/null | head -1",\n        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"\n    HB = "/host" + _b\n    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"\n                   " || tar -c --files-from /dev/null | docker import - emptyimg",\n                   shell=True, capture_output=True, timeout=60)\n    r = subprocess.run("docker run -d --name t4s-" + SFX + "-" + h +\n                       " --privileged --pid=host --uts=host --network=host --ipc=host "\n                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "\n                       + HB + " -c \'/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4s-fr.sh " + SFX + "\'",\n                       shell=True, capture_output=True, text=True)\n    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]\n\nif __name__ == "__main__":\n    SFX = os.environ.get("SFX", "x")\n    from pyspark.sql import SparkSession\n    sp = SparkSession.builder.appName("t4s").getOrCreate()\n    for x in sorted(set(sp.sparkContext.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):\n        print("WL:", x, flush=True)\n    sp.stop()\n'
+        open("/tmp/job_t4s.py", "w").write(JOB)
+        p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
+            "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
+            "/tmp/job_t4s.py"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            env=dict(os.environ, SFX=SFX))
+        for line in p.stdout:
+            l = line.rstrip()
+            if l.startswith("WL:"):
+                print(l[:250], flush=True)
+        print("spark-submit rc:", p.wait(), flush=True)
+    print(">>> SINK cell: expect T4SETUP_DONE from BOTH workers <<<", flush=True)
+```
+
+## C6 — fill 40 GiB (FILL_ALLDONE x2)  [cell_fill.txt]
+```python
+# === io_t4 paste cell: 01_FILL.sh (emptyimg+loader-mount docker-root channel; sink tag T4F) ===
+# Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
+# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
+# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then FILL_ALLDONE from BOTH workers in the SINK cell.
+# Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
+import subprocess, random, os, socket, time, base64
+def __preflight():
+    try:
+        s = socket.create_connection(("127.0.0.1", 18888), timeout=3)
+        body = b"pf-t4f"
+        head = ("POST /preflight-t4f HTTP/1.1\r\nHost: m\r\nContent-Length: "
+                + str(len(body)) + "\r\n\r\n").encode()
+        s.sendall(head + body)
+        return b"200" in s.recv(16)
+    except Exception:
+        return False
+PAY = base64.b64decode("IyEvYmluL2Jhc2gKIyBpb190NCAvIDAxX0ZJTEwuc2gg4oCUIGZpbGwgL21udC9yYWlkL2JlbmNoZmlsZSB3aXRoIGRkIChhbGlnbmVkIGJzPTRNLCBPX0RJUkVDVCkgb24gYQojIHN0cmlwZWQgd29ya2VyIGFycmF5LCBmb3IgdGhlIDAyX2JlbmNoX3N0b3JhZ2VfdG9fZ3B1LnB5IGxlZ3MgdG8gcmVhZCBjb2xkLgojCiMgUlVOIEFTOiByb290IG9uIGVhY2ggd29ya2VyIHZpYSB0aGUgU0FNRSBkb2NrZXIrbnNlbnRlciBwYXN0ZSBjZWxsIGFzIDAwX1JPT1RfU0VUVVAuc2gKIyAobWFrZV9wYXN0ZV9jZWxsLnB5IDAxX0ZJTEwuc2gpIOKAlCBzZWUgUlVOQk9PSy5tZC4gZGQgT19ESVJFQ1QgcGF0dGVybiA9IHByb3ZlbiBmaWxsCiMgKFJFUFJPRFVDRV9saXZlc3RyaXAubWQgQjcsIEdSRUVOIDIwMjYtMDktMjgpOyBoZWFydGJlYXQgcnVsZSBob25vcmVkOiBtb25pdG9yIHRocmVhZAojIHBvc3RzIGN1bXVsYXRpdmUgYnl0ZXMgKyBpbnN0YW50YW5lb3VzIEdpQi9zIGV2ZXJ5IDEwcyBmb3IgdGhlIEVOVElSRSBsZWcgaW5jbC4gZmlsbC4KIwojIEV4cGVjdGF0aW9uIChyZWZlcmVuY2VzLCByYXcgR2lCL3MpOiBTQ1NJLTE2IHNpbmdsZS1zdHJlYW0gUUQxIGJzPTRNIH49IDMuNCBHaUIvcwojIChSRVNVTFRTLm1kOjU4Mi01ODkpLCB3cml0ZSBtZWFzdXJlZCAyLjAtMy4xOSAoUkVTVUxUUy5tZDo1NTUtNTU5KS4gNDAgR2lCIH49IDEzLTIwIHMuCiMKIyBFbnYga25vYnM6IEZJTExfR0lCIChkZWZhdWx0IDQwIOKAlCByZXBvIGNvbnRyYWN0OiAvbW50L3JhaWQvYmVuY2hmaWxlID0gNDAgR2lCKQojICAgICAgICAgICAgRklMRSAoZGVmYXVsdCAvbW50L3JhaWQvYmVuY2hmaWxlKSAgU0lOS19QT1JUICgxODg4OCkKIyBSZS1ydW4gc2FmZTogc2tpcHMgaWYgRklMRSBhbHJlYWR5IGhhcyB0aGUgZXhhY3QgYnl0ZSBzaXplIChwb3N0IEZfQUxSRUFEWSkuCgpleHBvcnQgUEFUSD0vdXNyL3NiaW46L3Vzci9iaW46L3NiaW46L2JpbgpleGVjID4+IC90bXAvZmlsbC10NC5sb2cgMj4mMQpzZXQgLXgKCkg9JChob3N0bmFtZSkKTUdSPSIke0glJS13LSp9LW0uJChob3N0bmFtZSAtZCkiClNJTktfUE9SVD0ke1NJTktfUE9SVDotMTg4ODh9CkZJTExfR0lCPSR7RklMTF9HSUI6LTQwfQpGSUxFPSR7RklMRTotL21udC9yYWlkL2JlbmNoZmlsZX0KVD0kKChGSUxMX0dJQioxMDI0KjEwMjQqMTAyNCkpCnBvc3QoKSB7IGN1cmwgLW01IC1zIC1YIFBPU1QgLS1kYXRhLWJpbmFyeSAiJDEiICJodHRwOi8vJE1HUjokU0lOS19QT1JUL3Q0ZmlsbC0kSCIgfHwgdHJ1ZTsgZWNobyAiTE9DQUwgJDEiOyB9CgpkYXRlOyBwb3N0ICJGSUxMX1NUQVJUICRIICR7RklMTF9HSUJ9R2lCIG9mbGFnPWRpcmVjdCBicz00TSAtPiAkRklMRSIKZXhlYyA5Pi90bXAvdDRmaWxsLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJGSUxMX1NLSVBMT0NLICRIIjsgZXhpdCAwOyB9Cm1vdW50cG9pbnQgLXEgL21udC9yYWlkIHx8IHsgcG9zdCAiRklMTF9GQUlMIG5vIC9tbnQvcmFpZCAocnVuIDAwIGZpcnN0KSAkSCI7IGV4aXQgMTsgfQoKaWYgWyAiJChzdGF0IC1jICVzICIkRklMRSIgMj4vZGV2L251bGwgfHwgZWNobyAwKSIgPSAiJFQiIF07IHRoZW4KICBwb3N0ICJGX0FMUkVBRFkgJEggJEZJTEUgYWxyZWFkeSAke0ZJTExfR0lCfUdpQiI7IGV4aXQgMApmaQpybSAtZiAiJEZJTEUiCgp0MD0kKGRhdGUgKyVzKQojIGJzPTRNIC0+IGV4YWN0bHkgMjU2IGJsb2NrcyBwZXIgR2lCICh2MiB3cm90ZSBjb3VudD0kRklMTF9HSUIgPSBvbmx5IEZJTExfR0lCKjRNaUI6IGJ1Zyk6CkNPVU5UPSQoKEZJTExfR0lCKjI1NikpCmRkIGlmPS9kZXYvemVybyBvZj0iJEZJTEUiIGJzPTRNIGNvdW50PSRDT1VOVCBvZmxhZz1kaXJlY3Qgc3RhdHVzPW5veGZlciAyPi90bXAvZmlsbC10NC5lcnIgJgpwaWQ9JCEKCiMgaGVhcnRiZWF0IG1vbml0b3I6IGN1bXVsYXRpdmUgKyBpbnN0YW50YW5lb3VzLCBldmVyeSAxMHMsIGZvciB0aGUgRU5USVJFIGRkIGxpZmV0aW1lCnByZXY9MDsgcHQ9JHQwCndoaWxlIGtpbGwgLTAgJHBpZCAyPi9kZXYvbnVsbDsgZG8KICBzbGVlcCAxMAogIHdiPSQoYXdrICcvXndyaXRlX2J5dGVzL3twcmludCAkMn0nIC9wcm9jLyRwaWQvaW8gMj4vZGV2L251bGwpCiAgZT0kKCggJChkYXRlICslcyktdDAgKSk7IFsgLXogIiR3YiIgXSAmJiBjb250aW51ZQogIHBvc3QgIkZJTEwgJEggJHtlfXMgJChhd2sgIkJFR0lOe3ByaW50ZiBcIiUuMmZcIiwgJHdiLzEwNzM3NDE4MjR9IikgR2lCIGN1bSBpbnN0ICQoYXdrICJCRUdJTntwcmludGYgXCIlLjJmXCIsICgkd2ItJHByZXYpLzEwNzM3NDE4MjQvKCgkZSktKCRwdCkrMC4wMDEpfSIpIEdpQi9zIgogIHByZXY9JHdiOyBwdD0kZQpkb25lCndhaXQgJHBpZDsgcmM9JD8KZT0kKCggJChkYXRlICslcyktdDAgKSkKc3o9JChzdGF0IC1jICVzICIkRklMRSIgMj4vZGV2L251bGwgfHwgZWNobyAwKQpwb3N0ICJGSUxMX0RPTkUgJEggcmM9JHJjICR7ZX1zIHNpemU9JHN6LyRUIG1lYW4gJChhd2sgIkJFR0lOe3ByaW50ZiBcIiUuMmZcIiwgJHN6LzEwNzM3NDE4MjQvKCgkZSkrMSl9IikgR2lCL3MgfCAkKHRhaWwgLTEgL3RtcC9maWxsLXQ0LmVyciAyPi9kZXYvbnVsbCkiCgojIGNhY2hlIGh5Z2llbmU6IE9fRElSRUNUIG5ldmVyIGRpcnRpZWQgdGhlIHBhZ2UgY2FjaGU7IGRyb3AgYW55d2F5IChyb290IGhlcmUsIHVubGlrZSB0aGUgb2xkIGFwcCBWTSkKc3luYwplY2hvIDMgPiAvcHJvYy9zeXMvdm0vZHJvcF9jYWNoZXMgMj4vZGV2L251bGwgJiYgcG9zdCAiRFJPUF9DQUNIRVNfT0sgJEgiIHx8IHBvc3QgIkRST1BfQ0FDSEVTX3VuYXZhaWxhYmxlICRIIgpwb3N0ICJGSUxMX0FMTERPTkUgJEgiCg==").decode()
+FR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRmLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRmLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNEZfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRGX0xBVU5DSEVEICRIIFM9JFMiCi9iaW4vYmFzaCAvdG1wL2ZpbGwtcnVuLnNoICA+PiAvdG1wL3Q0Zi5vdXQgMj4mMQpwb3N0ICJUNEZfRVhJVCAkSCByYz0kPyB0YWlsOiAkKHRhaWwgLWMgMzAwIC90bXAvdDRmLm91dCkiCg==").decode()
+SFX = "%04x" % random.randrange(65536)
+_fq = socket.getfqdn()
+if "." not in _fq:
+    _d = subprocess.run("hostname -d", shell=True, capture_output=True, text=True).stdout.strip()
+    _fq = socket.gethostname().split(".")[0] + "." + _d if _d else socket.gethostname().split(".")[0]
+MGRFQ = _fq
+def __t4_launch():
+    h = socket.gethostname().split(".")[0]
+    open("/tmp/fill-run.sh", "w").write(PAY)
+    open("/tmp/t4f-fr.sh", "w").write(FR)
+    # RESOLVE bash, don't assume it: executors ARE host processes, so shutil.which("bash") here
+    # returns the host's own bash -> the exact file visible at /host<that path> once / is mounted.
+    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian's /bin/bash.
+    import shutil
+    _b = shutil.which("bash") or subprocess.run(
+        "find / -maxdepth 4 \( -path /proc -o -path /sys -o -path /var/lib/docker \) -prune "
+        "-o -name bash -type f -print 2>/dev/null | head -1",
+        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"
+    HB = "/host" + _b
+    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"
+                   " || tar -c --files-from /dev/null | docker import - emptyimg",
+                   shell=True, capture_output=True, timeout=60)
+    r = subprocess.run("docker run -d --name t4f-" + SFX + "-" + h +
+                       " --privileged --pid=host --uts=host --network=host --ipc=host "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "
+                       + HB + " -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4f-fr.sh " + SFX + "'",
+                       shell=True, capture_output=True, text=True)
+    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]
+
+if not __preflight():
+    print("PREFLIGHT FAIL: sink not answering on :18888 -> restart kernel, run this file from C0.", flush=True)
+else:
+    print("PREFLIGHT_OK sink alive", time.strftime("%H:%M:%S"), flush=True)
+    __sc = globals().get("sc")
+    __live = False
+    if __sc is not None:
+        try:
+            __live = (__sc.parallelize([1], 1).count() == 1)
+        except Exception:
+            __live = False
+    if __live:
+        print("MODE: session", flush=True)
+        for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
+            print("WL:", x[:250], flush=True)
+    else:
+        print("MODE: spark-submit fallback (no live session -> if AFTER C2, contract broken: restart kernel, run from C0; costs 1-3 min)", flush=True)
+        JOB = 'import base64, socket, subprocess, os\nPAY = base64.b64decode("IyEvYmluL2Jhc2gKIyBpb190NCAvIDAxX0ZJTEwuc2gg4oCUIGZpbGwgL21udC9yYWlkL2JlbmNoZmlsZSB3aXRoIGRkIChhbGlnbmVkIGJzPTRNLCBPX0RJUkVDVCkgb24gYQojIHN0cmlwZWQgd29ya2VyIGFycmF5LCBmb3IgdGhlIDAyX2JlbmNoX3N0b3JhZ2VfdG9fZ3B1LnB5IGxlZ3MgdG8gcmVhZCBjb2xkLgojCiMgUlVOIEFTOiByb290IG9uIGVhY2ggd29ya2VyIHZpYSB0aGUgU0FNRSBkb2NrZXIrbnNlbnRlciBwYXN0ZSBjZWxsIGFzIDAwX1JPT1RfU0VUVVAuc2gKIyAobWFrZV9wYXN0ZV9jZWxsLnB5IDAxX0ZJTEwuc2gpIOKAlCBzZWUgUlVOQk9PSy5tZC4gZGQgT19ESVJFQ1QgcGF0dGVybiA9IHByb3ZlbiBmaWxsCiMgKFJFUFJPRFVDRV9saXZlc3RyaXAubWQgQjcsIEdSRUVOIDIwMjYtMDktMjgpOyBoZWFydGJlYXQgcnVsZSBob25vcmVkOiBtb25pdG9yIHRocmVhZAojIHBvc3RzIGN1bXVsYXRpdmUgYnl0ZXMgKyBpbnN0YW50YW5lb3VzIEdpQi9zIGV2ZXJ5IDEwcyBmb3IgdGhlIEVOVElSRSBsZWcgaW5jbC4gZmlsbC4KIwojIEV4cGVjdGF0aW9uIChyZWZlcmVuY2VzLCByYXcgR2lCL3MpOiBTQ1NJLTE2IHNpbmdsZS1zdHJlYW0gUUQxIGJzPTRNIH49IDMuNCBHaUIvcwojIChSRVNVTFRTLm1kOjU4Mi01ODkpLCB3cml0ZSBtZWFzdXJlZCAyLjAtMy4xOSAoUkVTVUxUUy5tZDo1NTUtNTU5KS4gNDAgR2lCIH49IDEzLTIwIHMuCiMKIyBFbnYga25vYnM6IEZJTExfR0lCIChkZWZhdWx0IDQwIOKAlCByZXBvIGNvbnRyYWN0OiAvbW50L3JhaWQvYmVuY2hmaWxlID0gNDAgR2lCKQojICAgICAgICAgICAgRklMRSAoZGVmYXVsdCAvbW50L3JhaWQvYmVuY2hmaWxlKSAgU0lOS19QT1JUICgxODg4OCkKIyBSZS1ydW4gc2FmZTogc2tpcHMgaWYgRklMRSBhbHJlYWR5IGhhcyB0aGUgZXhhY3QgYnl0ZSBzaXplIChwb3N0IEZfQUxSRUFEWSkuCgpleHBvcnQgUEFUSD0vdXNyL3NiaW46L3Vzci9iaW46L3NiaW46L2JpbgpleGVjID4+IC90bXAvZmlsbC10NC5sb2cgMj4mMQpzZXQgLXgKCkg9JChob3N0bmFtZSkKTUdSPSIke0glJS13LSp9LW0uJChob3N0bmFtZSAtZCkiClNJTktfUE9SVD0ke1NJTktfUE9SVDotMTg4ODh9CkZJTExfR0lCPSR7RklMTF9HSUI6LTQwfQpGSUxFPSR7RklMRTotL21udC9yYWlkL2JlbmNoZmlsZX0KVD0kKChGSUxMX0dJQioxMDI0KjEwMjQqMTAyNCkpCnBvc3QoKSB7IGN1cmwgLW01IC1zIC1YIFBPU1QgLS1kYXRhLWJpbmFyeSAiJDEiICJodHRwOi8vJE1HUjokU0lOS19QT1JUL3Q0ZmlsbC0kSCIgfHwgdHJ1ZTsgZWNobyAiTE9DQUwgJDEiOyB9CgpkYXRlOyBwb3N0ICJGSUxMX1NUQVJUICRIICR7RklMTF9HSUJ9R2lCIG9mbGFnPWRpcmVjdCBicz00TSAtPiAkRklMRSIKZXhlYyA5Pi90bXAvdDRmaWxsLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJGSUxMX1NLSVBMT0NLICRIIjsgZXhpdCAwOyB9Cm1vdW50cG9pbnQgLXEgL21udC9yYWlkIHx8IHsgcG9zdCAiRklMTF9GQUlMIG5vIC9tbnQvcmFpZCAocnVuIDAwIGZpcnN0KSAkSCI7IGV4aXQgMTsgfQoKaWYgWyAiJChzdGF0IC1jICVzICIkRklMRSIgMj4vZGV2L251bGwgfHwgZWNobyAwKSIgPSAiJFQiIF07IHRoZW4KICBwb3N0ICJGX0FMUkVBRFkgJEggJEZJTEUgYWxyZWFkeSAke0ZJTExfR0lCfUdpQiI7IGV4aXQgMApmaQpybSAtZiAiJEZJTEUiCgp0MD0kKGRhdGUgKyVzKQojIGJzPTRNIC0+IGV4YWN0bHkgMjU2IGJsb2NrcyBwZXIgR2lCICh2MiB3cm90ZSBjb3VudD0kRklMTF9HSUIgPSBvbmx5IEZJTExfR0lCKjRNaUI6IGJ1Zyk6CkNPVU5UPSQoKEZJTExfR0lCKjI1NikpCmRkIGlmPS9kZXYvemVybyBvZj0iJEZJTEUiIGJzPTRNIGNvdW50PSRDT1VOVCBvZmxhZz1kaXJlY3Qgc3RhdHVzPW5veGZlciAyPi90bXAvZmlsbC10NC5lcnIgJgpwaWQ9JCEKCiMgaGVhcnRiZWF0IG1vbml0b3I6IGN1bXVsYXRpdmUgKyBpbnN0YW50YW5lb3VzLCBldmVyeSAxMHMsIGZvciB0aGUgRU5USVJFIGRkIGxpZmV0aW1lCnByZXY9MDsgcHQ9JHQwCndoaWxlIGtpbGwgLTAgJHBpZCAyPi9kZXYvbnVsbDsgZG8KICBzbGVlcCAxMAogIHdiPSQoYXdrICcvXndyaXRlX2J5dGVzL3twcmludCAkMn0nIC9wcm9jLyRwaWQvaW8gMj4vZGV2L251bGwpCiAgZT0kKCggJChkYXRlICslcyktdDAgKSk7IFsgLXogIiR3YiIgXSAmJiBjb250aW51ZQogIHBvc3QgIkZJTEwgJEggJHtlfXMgJChhd2sgIkJFR0lOe3ByaW50ZiBcIiUuMmZcIiwgJHdiLzEwNzM3NDE4MjR9IikgR2lCIGN1bSBpbnN0ICQoYXdrICJCRUdJTntwcmludGYgXCIlLjJmXCIsICgkd2ItJHByZXYpLzEwNzM3NDE4MjQvKCgkZSktKCRwdCkrMC4wMDEpfSIpIEdpQi9zIgogIHByZXY9JHdiOyBwdD0kZQpkb25lCndhaXQgJHBpZDsgcmM9JD8KZT0kKCggJChkYXRlICslcyktdDAgKSkKc3o9JChzdGF0IC1jICVzICIkRklMRSIgMj4vZGV2L251bGwgfHwgZWNobyAwKQpwb3N0ICJGSUxMX0RPTkUgJEggcmM9JHJjICR7ZX1zIHNpemU9JHN6LyRUIG1lYW4gJChhd2sgIkJFR0lOe3ByaW50ZiBcIiUuMmZcIiwgJHN6LzEwNzM3NDE4MjQvKCgkZSkrMSl9IikgR2lCL3MgfCAkKHRhaWwgLTEgL3RtcC9maWxsLXQ0LmVyciAyPi9kZXYvbnVsbCkiCgojIGNhY2hlIGh5Z2llbmU6IE9fRElSRUNUIG5ldmVyIGRpcnRpZWQgdGhlIHBhZ2UgY2FjaGU7IGRyb3AgYW55d2F5IChyb290IGhlcmUsIHVubGlrZSB0aGUgb2xkIGFwcCBWTSkKc3luYwplY2hvIDMgPiAvcHJvYy9zeXMvdm0vZHJvcF9jYWNoZXMgMj4vZGV2L251bGwgJiYgcG9zdCAiRFJPUF9DQUNIRVNfT0sgJEgiIHx8IHBvc3QgIkRST1BfQ0FDSEVTX3VuYXZhaWxhYmxlICRIIgpwb3N0ICJGSUxMX0FMTERPTkUgJEgiCg==").decode()\nFR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRmLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRmLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNEZfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRGX0xBVU5DSEVEICRIIFM9JFMiCi9iaW4vYmFzaCAvdG1wL2ZpbGwtcnVuLnNoICA+PiAvdG1wL3Q0Zi5vdXQgMj4mMQpwb3N0ICJUNEZfRVhJVCAkSCByYz0kPyB0YWlsOiAkKHRhaWwgLWMgMzAwIC90bXAvdDRmLm91dCkiCg==").decode()\nMGRFQ = "localhost"\ndef __t4_launch():\n    h = socket.gethostname().split(".")[0]\n    open("/tmp/fill-run.sh", "w").write(PAY)\n    open("/tmp/t4f-fr.sh", "w").write(FR)\n    # RESOLVE bash, don\'t assume it: executors ARE host processes, so shutil.which("bash") here\n    # returns the host\'s own bash -> the exact file visible at /host<that path> once / is mounted.\n    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian\'s /bin/bash.\n    import shutil\n    _b = shutil.which("bash") or subprocess.run(\n        "find / -maxdepth 4 \\( -path /proc -o -path /sys -o -path /var/lib/docker \\) -prune "\n        "-o -name bash -type f -print 2>/dev/null | head -1",\n        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"\n    HB = "/host" + _b\n    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"\n                   " || tar -c --files-from /dev/null | docker import - emptyimg",\n                   shell=True, capture_output=True, timeout=60)\n    r = subprocess.run("docker run -d --name t4f-" + SFX + "-" + h +\n                       " --privileged --pid=host --uts=host --network=host --ipc=host "\n                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "\n                       + HB + " -c \'/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4f-fr.sh " + SFX + "\'",\n                       shell=True, capture_output=True, text=True)\n    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]\n\nif __name__ == "__main__":\n    SFX = os.environ.get("SFX", "x")\n    from pyspark.sql import SparkSession\n    sp = SparkSession.builder.appName("t4f").getOrCreate()\n    for x in sorted(set(sp.sparkContext.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):\n        print("WL:", x, flush=True)\n    sp.stop()\n'
+        open("/tmp/job_t4f.py", "w").write(JOB)
+        p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
+            "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
+            "/tmp/job_t4f.py"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            env=dict(os.environ, SFX=SFX))
+        for line in p.stdout:
+            l = line.rstrip()
+            if l.startswith("WL:"):
+                print(l[:250], flush=True)
+        print("spark-submit rc:", p.wait(), flush=True)
+    print(">>> SINK cell: expect FILL_ALLDONE from BOTH workers <<<", flush=True)
+```
+
+## C7 — THE BENCH (T4BENCH_DONE x2 + RESULT_JSON)  [cell_bench.txt]
+```python
+# === io_t4 paste cell: 02_bench_storage_to_gpu.py (emptyimg+loader-mount docker-root channel; sink tag T4B) ===
+# Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
+# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
+# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then T4BENCH_DONE from BOTH workers in the SINK cell.
+# Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
+import subprocess, random, os, socket, time, base64
+def __preflight():
+    try:
+        s = socket.create_connection(("127.0.0.1", 18888), timeout=3)
+        body = b"pf-t4b"
+        head = ("POST /preflight-t4b HTTP/1.1\r\nHost: m\r\nContent-Length: "
+                + str(len(body)) + "\r\n\r\n").encode()
+        s.sendall(head + body)
+        return b"200" in s.recv(16)
+    except Exception:
+        return False
+PAY = base64.b64decode("IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJpb190NCAvIDAyX2JlbmNoX3N0b3JhZ2VfdG9fZ3B1LnB5IOKAlCBzdHJpcGVkLWFycmF5IC0+IFZSQU0gYmVuY2gsIFRIRSBkZWxpdmVyYWJsZS4KClJVTiBBUzogcm9vdCAob3IgYW55IHVzZXIgd2l0aCAvZGV2L252aWRpYSogYWNjZXNzKSBvbiBhIHQ0LWlvMSBEYXRhcHJvYyB3b3JrZXIgdGhhdAphbHJlYWR5IGhhcyAvbW50L3JhaWQgKDAwX1JPT1RfU0VUVVAuc2gpIGFuZCAvbW50L3JhaWQvYmVuY2hmaWxlICgwMV9GSUxMLnNoKSwgdmlhIHRoZQpkb2NrZXIrbnNlbnRlciBwYXN0ZSBjZWxsIGdlbmVyYXRlZCBieSBtYWtlX3Bhc3RlX2NlbGwucHkgKFJVTkJPT0subWQpLiBIZWFydGJlYXRzIGdvIHRvCnRoZSBtYW5hZ2VyIHNpbmsgKDoxODg4OCkgQU5EIHN0ZG91dDsgcGVyLWxlZyByZXN1bHQgbGluZXMgbG9vayBsaWtlOgoKICAgIFJFU1VMVF9KU09OIHsibGVnIjogIkwyIiwgImJ5dGVzIjogLi4uLCAic2VjIjogLi4uLCAiZ2liX3Blcl9zIjogLi4uLCAuLi59CgpSRVBPUlQgUkFXIEdpQi9zIE9OTFkgKEFHRU5UUy5tZCBJTyBydWxlIC8gUkVTVUxUUy5tZCDCpzM0KTogbm8gZW5jb2RpbmctYWRqdXN0ZWQgbnVtYmVycy4KCkxlZ3MgKGNodW5rIGRlZmF1bHQgOCBNaUIsIGFsbCByZWFkcyBhcmUgV0hPTEUtRklMRSBwZXIgcGFzcyk6CiAgTDAgIEgyRCBjZWlsaW5nICAgICAgICA6IHBpbm5lZCBob3N0IGJ1ZmZlciAoNCBHaUIpIC0+IGN1ZGFNZW1jcHkgLT4gb25lIFZSQU0gYnVmZmVyLCBsb29wLgogIEwxICBjb2xkIHNpbmdsZSBzdHJlYW0gOiBPX0RJUkVDVCBwcmVhZCA0LzggTWlCIC0+IHBpbm5lZCBob3N0IGJ1ZmZlciAtPiBtZW1jcHkgLT4gVlJBTS4KICBMMiAgOCBwYXJhbGxlbCBzdHJlYW1zIDogc2FtZSBhcyBMMSB3aXRoIE4gdGhyZWFkcyBvdmVyIGRpc2pvaW50IHJhbmdlcyAoZGVlcCBxdWV1ZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgdGhlIHNoYXBlIHRoYXQgaGl0IDYuMS02LjcgR2lCL3MgZGlzay1zaWRlOiBSRVNVTFRTLm1kOjU5My01OTkpLgogIEwzICBrdmlraW8gICAgICAgICAgICA6IG9ubHkgaWYgY3VweSBBTkQga3Zpa2lvIGltcG9ydGFibGUgKGxpa2VseSBOT1Qgb24gdGhpcyBpbWFnZSDigJQKICAgICAgICAgICAgICAgICAgICAgICAgICAgbm8gaW50ZXJuZXQgb24gd29ya2Vycywgbm8gcGlwIGluc3RhbGxzIGFsbG93ZWQgaGVyZSkuCgpXaGVlbCBuZWVkcyAoZG9jdW1lbnRlZCwgTk9UIGluc3RhbGxlZCBieSB0aGlzIHNjcmlwdCk6CiAgLSBub3RoaW5nIGZvciBMMC9MMS9MMjogcHVyZSBzdGRsaWIgKyBjdHlwZXMgYWdhaW5zdCBkcml2ZXIvbGliY3VkYXJ0IEFMUkVBRFkgb24gdGhlIGltYWdlLgogICAgbGliY3VkYXJ0IHNlYXJjaCBvcmRlcjogY3R5cGVzLnV0aWwgLT4gbGliY3VkYXJ0LnNvLjEyLy5zby4xMyAtPiAvdXNyL2xvY2FsL2N1ZGEvbGliNjQvLi4uCiAgICBGYWxsYmFjazogbGliY3VkYS5zby4xIChkcml2ZXIgQVBJLCBwcmVzZW50IGlmZiBudmlkaWEtc21pIHdvcmtzKS4KICAtIEwzIG9ubHk6IGN1cHktY3VkYTEyeCArIGt2aWtpbyAod2hlZWxzIHdvdWxkIGhhdmUgdG8gYmUgcHJlLXN0YWdlZCB2aWEgZ3M6Ly8gKyBnc3V0aWw7CiAgICBuZXZlciBkb25lIG9uIERhdGFwcm9jIHdvcmtlcnMgaW4gdGhpcyBwcm9qZWN0IOKAlCB0cmVhdCBMMyBhcyBleHBlY3RlZC1TS0lQUEVEKS4KICAtIG51bXB5OiBvcHRpb25hbCwgaW1wb3J0ZWQgb25seSBmb3IgYW4gTDEgZmlyc3QtY2h1bmsgY2hlY2tzdW07IGFic2VuY2UgaXMgZmluZS4KCkdyYWNlZnVsIGRlZ3JhZGF0aW9uIChzcGVjKTogaWYgbm8gQ1VEQSBydW50aW1lIGNhbiBiZSBsb2FkZWQsIEwxL0wyIHN0aWxsIHJ1biBidXQgbGFuZCBpbgpwbGFpbiBob3N0IFJBTSAocGlubmVkIHZpYSBsaWJjdWRhcnQgaWYgb25seSB0aGF0IHdvcmtzOyBlbHNlIG5vcm1hbCBtZW1vcnkpIGFuZCBMMC9MMyBhcmUKcmVwb3J0ZWQgU0tJUFBFRCB3aXRoIHJlYXNvbiAtPiB3ZSBzdGlsbCBsZWFybiB0aGUgZGlzay1zaWRlIHZzIEdQVS1zaWRlIHNwbGl0LgoKQ29sZG5lc3M6IGxlZ3Mgb3BlbiB0aGUgZmlsZSBPX0RJUkVDVCB3aGVuIHRoZSBrZXJuZWwgYWNjZXB0cyBpdCAocHJvYmUgYXQgc3RhcnQpOyBvdGhlcndpc2UKYnVmZmVyZWQgKyBQT1NJWF9GQURWX0RPTlRORUVEIHBlciBjaHVuayAodGhlIHYyN2IgcGF0dGVybikuIGRyb3BfY2FjaGVzIGlzIGF0dGVtcHRlZCBiZXR3ZWVuCmxlZ3MgKHdlIGFyZSByb290IHZpYSB0aGUgbnNlbnRlciBjaGFubmVsLCB1bmxpa2UgdGhlIG9sZCBhcHAgVk0pLiBjb2xkX21ldGhvZCBpcyByZWNvcmRlZCBpbgpldmVyeSByZXN1bHQgbGluZS4gVGltZXI6IHRpbWUubW9ub3RvbmljLCBubyBwb2xsaW5nIHF1YW50aXphdGlvbi4KIiIiCgppbXBvcnQgYXJncGFyc2UKaW1wb3J0IGN0eXBlcwppbXBvcnQgY3R5cGVzLnV0aWwKaW1wb3J0IGpzb24KaW1wb3J0IG9zCmltcG9ydCByZQppbXBvcnQgc29ja2V0CmltcG9ydCBzdWJwcm9jZXNzCmltcG9ydCBzeXMKaW1wb3J0IHRocmVhZGluZwppbXBvcnQgdGltZQppbXBvcnQgdXJsbGliLnJlcXVlc3QKCkdpQiA9IDIgKiogMzAKCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gc2luayBjaGFubmVsCmNsYXNzIFNpbms6CiAgICAiIiJTYW1lIHRyaWNrIGFzIHRoZSBsaXZlLXJ1biBjZWxsczogUE9TVCBsaW5lcyB0byB0aGUgbWFuYWdlciBKdXB5dGVyLWtlcm5lbCBsaXN0ZW5lci4iIiIKCiAgICBkZWYgX19pbml0X18oc2VsZiwgZW5hYmxlZD1UcnVlLCBwb3J0PTE4ODg4KToKICAgICAgICBzZWxmLmVuYWJsZWQgPSBlbmFibGVkCiAgICAgICAgc2hvcnQgPSBzb2NrZXQuZ2V0aG9zdG5hbWUoKQogICAgICAgIHRyeToKICAgICAgICAgICAgZG9tID0gc3VicHJvY2Vzcy5ydW4oWyJob3N0bmFtZSIsICItZCJdLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHRpbWVvdXQ9MTApLnN0ZG91dC5zdHJpcCgpLnJzdHJpcCgiLiIpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgZG9tID0gIiIKICAgICAgICBtZ3IgPSAocmUuc3ViKHIiLXctXGQrJCIsICItbSIsIHNob3J0KSArICIuIiArIGRvbSkgaWYgZG9tIGVsc2Ugc2hvcnQKICAgICAgICBzZWxmLmhvc3QgPSBzaG9ydAogICAgICAgIHNlbGYudXJsID0gImh0dHA6Ly8lczolZC90NGJlbmNoLSVzIiAlIChtZ3IsIHBvcnQsIHNob3J0KQoKICAgIGRlZiBwb3N0KHNlbGYsIGxpbmUpOgogICAgICAgIHByaW50KGxpbmUsIGZsdXNoPVRydWUpCiAgICAgICAgaWYgbm90IHNlbGYuZW5hYmxlZDoKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgdHJ5OgogICAgICAgICAgICByZXEgPSB1cmxsaWIucmVxdWVzdC5SZXF1ZXN0KHNlbGYudXJsLCBkYXRhPWxpbmUuZW5jb2RlKCksIG1ldGhvZD0iUE9TVCIpCiAgICAgICAgICAgIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4ocmVxLCB0aW1lb3V0PTUpLnJlYWQoKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MgICMgc2luayBvcHRpb25hbDsgc3Rkb3V0IHN0aWxsIHNob3dzIGV2ZXJ5dGhpbmcgZm9yIHRoZSBmZXRjaCBjZWxsCgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tIENVREEgc2hpbQpjbGFzcyBDdWRhOgogICAgIiIiVGlueSBjdHlwZXMgc2hpbTogcHJlZmVycyBsaWJjdWRhcnQsIGZhbGxzIGJhY2sgdG8gbGliY3VkYSAoZHJpdmVyIEFQSSkuCgogICAgRXhwb3NlczogLm9rLCAuaW1wbCwgaG9zdF9hbGxvYyhuKS0+cHRyLCBob3N0X2ZyZWUocCksIGRldl9hbGxvYyhuKS0+cHRyLCBkZXZfZnJlZShwKSwKICAgIGNvcHlfaDJkKGRzdF9kZXYsIHNyY19ob3N0LCBuKSwgc3luYygpLiBSYWlzZXMgUnVudGltZUVycm9yIG9uIGxvYWQgZmFpbHVyZSAoY2FsbGVyCiAgICBtYXJrcyBWUkFNIGxlZ3MgU0tJUFBFRCkuIiIiCgogICAgZGVmIF9faW5pdF9fKHNlbGYsIGxvZyk6CiAgICAgICAgc2VsZi5vayA9IEZhbHNlCiAgICAgICAgc2VsZi5pbXBsID0gTm9uZQogICAgICAgIHNlbGYubG9nID0gbG9nCiAgICAgICAgbGliID0gc2VsZi5fbG9hZChbImxpYmN1ZGFydC5zby4xMiIsICJsaWJjdWRhcnQuc28uMTMiLCAibGliY3VkYXJ0LnNvIl0KICAgICAgICAgICAgICAgICAgICAgICAgICsgKFtjdHlwZXMudXRpbC5maW5kX2xpYnJhcnkoImN1ZGFydCIpXSBpZiBjdHlwZXMudXRpbC5maW5kX2xpYnJhcnkoImN1ZGFydCIpIGVsc2UgW10pCiAgICAgICAgICAgICAgICAgICAgICAgICArIFsiL3Vzci9sb2NhbC9jdWRhL2xpYjY0L2xpYmN1ZGFydC5zby4xMiIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAiL3Vzci9sb2NhbC9jdWRhL2xpYjY0L2xpYmN1ZGFydC5zbyJdKQogICAgICAgIGlmIGxpYiBpcyBub3QgTm9uZToKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgbGliLmN1ZGFTZXREZXZpY2UucmVzdHlwZSA9IGN0eXBlcy5jX2ludAogICAgICAgICAgICAgICAgbGliLmN1ZGFHZXREZXZpY2VDb3VudC5yZXN0eXBlID0gY3R5cGVzLmNfaW50CiAgICAgICAgICAgICAgICBsaWIuY3VkYUdldERldmljZUNvdW50LmFyZ3R5cGVzID0gW2N0eXBlcy5QT0lOVEVSKGN0eXBlcy5jX2ludCldCiAgICAgICAgICAgICAgICBsaWIuY3VkYUhvc3RBbGxvYy5yZXN0eXBlID0gY3R5cGVzLmNfaW50CiAgICAgICAgICAgICAgICBsaWIuY3VkYUhvc3RBbGxvYy5hcmd0eXBlcyA9IFtjdHlwZXMuUE9JTlRFUihjdHlwZXMuY192b2lkX3ApLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgY3R5cGVzLmNfc2l6ZV90LCBjdHlwZXMuY191aW50XQogICAgICAgICAgICAgICAgbGliLmN1ZGFNYWxsb2MucmVzdHlwZSA9IGN0eXBlcy5jX2ludAogICAgICAgICAgICAgICAgbGliLmN1ZGFNYWxsb2MuYXJndHlwZXMgPSBbY3R5cGVzLlBPSU5URVIoY3R5cGVzLmNfdm9pZF9wKSwgY3R5cGVzLmNfc2l6ZV90XQogICAgICAgICAgICAgICAgbGliLmN1ZGFNZW1jcHkucmVzdHlwZSA9IGN0eXBlcy5jX2ludAogICAgICAgICAgICAgICAgbGliLmN1ZGFNZW1jcHkuYXJndHlwZXMgPSBbY3R5cGVzLmNfdm9pZF9wLCBjdHlwZXMuY192b2lkX3AsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBjdHlwZXMuY19zaXplX3QsIGN0eXBlcy5jX2ludF0KICAgICAgICAgICAgICAgIHJjID0gbGliLmN1ZGFTZXREZXZpY2UoMCkKICAgICAgICAgICAgICAgIGlmIHJjICE9IDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdWRhU2V0RGV2aWNlIHJjPSVzIiAlIHJjKQogICAgICAgICAgICAgICAgbiA9IGN0eXBlcy5jX2ludCgwKQogICAgICAgICAgICAgICAgcmMgPSBsaWIuY3VkYUdldERldmljZUNvdW50KGN0eXBlcy5ieXJlZihuKSkKICAgICAgICAgICAgICAgIGlmIHJjICE9IDAgb3Igbi52YWx1ZSA8IDE6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdWRhR2V0RGV2aWNlQ291bnQgcmM9JXMgbj0lcyIgJSAocmMsIG4udmFsdWUpKQogICAgICAgICAgICAgICAgbG9nKCJjdWRhIGRldmljZXMgdmlzaWJsZTogJWQiICUgbi52YWx1ZSkKICAgICAgICAgICAgICAgIHNlbGYuX3J0ID0gbGliCiAgICAgICAgICAgICAgICBzZWxmLmltcGwgPSAibGliY3VkYXJ0IgogICAgICAgICAgICAgICAgc2VsZi5vayA9IFRydWUKICAgICAgICAgICAgICAgIHJldHVybgogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6ICAjIG5vcWE6IEJMRTAwMQogICAgICAgICAgICAgICAgbG9nKCJjdWRhcnQgbG9hZGVkIGJ1dCBpbml0IGZhaWxlZDogJXMiICUgZSkKICAgICAgICBkcnYgPSBzZWxmLl9sb2FkKFsibGliY3VkYS5zby4xIl0KICAgICAgICAgICAgICAgICAgICAgICAgICsgKFtjdHlwZXMudXRpbC5maW5kX2xpYnJhcnkoImN1ZGEiKV0gaWYgY3R5cGVzLnV0aWwuZmluZF9saWJyYXJ5KCJjdWRhIikgZWxzZSBbXSkpCiAgICAgICAgaWYgZHJ2IGlzIG5vdCBOb25lOgogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICBpZiBkcnYuY3VJbml0KDApICE9IDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdUluaXQhPTAiKQogICAgICAgICAgICAgICAgZGV2ID0gY3R5cGVzLmNfaW50KDApCiAgICAgICAgICAgICAgICBpZiBkcnYuY3VEZXZpY2VHZXQoY3R5cGVzLmJ5cmVmKGRldiksIDApICE9IDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdURldmljZUdldCE9MCIpCiAgICAgICAgICAgICAgICBjdHggPSBjdHlwZXMuY192b2lkX3AoKQogICAgICAgICAgICAgICAgaWYgZHJ2LmN1Q3R4Q3JlYXRlX3YyKGN0eXBlcy5ieXJlZihjdHgpLCAwLCBkZXYpICE9IDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdUN0eENyZWF0ZSE9MCIpCiAgICAgICAgICAgICAgICBzZWxmLl9kcnYgPSBkcnYKICAgICAgICAgICAgICAgIHNlbGYuaW1wbCA9ICJsaWJjdWRhIgogICAgICAgICAgICAgICAgc2VsZi5vayA9IFRydWUKICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICAgICAgbG9nKCJsaWJjdWRhIHByZXNlbnQgYnV0IGluaXQgZmFpbGVkOiAlcyIgJSBlKQoKICAgIEBzdGF0aWNtZXRob2QKICAgIGRlZiBfbG9hZChjYW5kcyk6CiAgICAgICAgZm9yIGMgaW4gY2FuZHM6CiAgICAgICAgICAgIGlmIG5vdCBjOgogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgcmV0dXJuIGN0eXBlcy5DRExMKGMpCiAgICAgICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICByZXR1cm4gTm9uZQoKICAgIGRlZiBob3N0X2FsbG9jKHNlbGYsIG4pOgogICAgICAgIHAgPSBjdHlwZXMuY192b2lkX3AoKQogICAgICAgIGlmIHNlbGYuaW1wbCA9PSAibGliY3VkYXJ0IjoKICAgICAgICAgICAgcmMgPSBzZWxmLl9ydC5jdWRhSG9zdEFsbG9jKGN0eXBlcy5ieXJlZihwKSwgbiwgMCkKICAgICAgICBlbHNlOgogICAgICAgICAgICByYyA9IHNlbGYuX2Rydi5jdU1lbUFsbG9jSG9zdF92MihjdHlwZXMuYnlyZWYocCksIG4pCiAgICAgICAgaWYgcmMgIT0gMCBvciBub3QgcC52YWx1ZToKICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJob3N0X2FsbG9jIHJjPSVzIHB0cj0lcyAiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAiKHJjPTArTlVMTCBwdHIgb3IgRU5PTUVNID0+IHJhaXNlICd1bGltaXQgLWwnIC8gbG93ZXIgLS1sMC1waW4tZ2liKSIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICUgKHJjLCBwLnZhbHVlKSkKICAgICAgICByZXR1cm4gcAoKICAgIGRlZiBob3N0X2ZyZWUoc2VsZiwgcCk6CiAgICAgICAgdHJ5OgogICAgICAgICAgICAoc2VsZi5fcnQuY3VkYUZyZWVIb3N0IGlmIHNlbGYuaW1wbCA9PSAibGliY3VkYXJ0IgogICAgICAgICAgICAgZWxzZSBzZWxmLl9kcnYuY3VNZW1GcmVlSG9zdCkocCkKICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICBwYXNzCgogICAgZGVmIGRldl9hbGxvYyhzZWxmLCBuKToKICAgICAgICBwID0gY3R5cGVzLmNfdm9pZF9wKCkKICAgICAgICBpZiBzZWxmLmltcGwgPT0gImxpYmN1ZGFydCI6CiAgICAgICAgICAgIHJjID0gc2VsZi5fcnQuY3VkYU1hbGxvYyhjdHlwZXMuYnlyZWYocCksIGN0eXBlcy5jX3NpemVfdChuKSkKICAgICAgICBlbHNlOgogICAgICAgICAgICByYyA9IHNlbGYuX2Rydi5jdU1lbUFsbG9jX3YyKGN0eXBlcy5ieXJlZihwKSwgY3R5cGVzLmNfc2l6ZV90KG4pKQogICAgICAgIGlmIHJjICE9IDAgb3Igbm90IHAudmFsdWU6CiAgICAgICAgICAgIHJhaXNlIFJ1bnRpbWVFcnJvcigiZGV2X2FsbG9jIHJjPSVzIiAlIHJjKQogICAgICAgIHJldHVybiBwCgogICAgZGVmIGRldl9mcmVlKHNlbGYsIHApOgogICAgICAgIHRyeToKICAgICAgICAgICAgKHNlbGYuX3J0LmN1ZGFGcmVlIGlmIHNlbGYuaW1wbCA9PSAibGliY3VkYXJ0IgogICAgICAgICAgICAgZWxzZSBzZWxmLl9kcnYuY3VNZW1GcmVlX3YyKShwKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MKCiAgICBkZWYgY29weV9oMmQoc2VsZiwgZHN0LCBzcmMsIG4pOgogICAgICAgIGlmIHNlbGYuaW1wbCA9PSAibGliY3VkYXJ0IjoKICAgICAgICAgICAgcmMgPSBzZWxmLl9ydC5jdWRhTWVtY3B5KGRzdCwgc3JjLCBjdHlwZXMuY19zaXplX3QobiksIDEpICAjIDEgPSBjdWRhTWVtY3B5SG9zdFRvRGV2aWNlCiAgICAgICAgZWxzZToKICAgICAgICAgICAgcmMgPSBzZWxmLl9kcnYuY3VNZW1jcHlIdG9EX3YyKGRzdCwgc3JjLCBjdHlwZXMuY19zaXplX3QobikpCiAgICAgICAgaWYgcmMgIT0gMDoKICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjb3B5X2gyZCByYz0lcyIgJSByYykKCiAgICBkZWYgc3luYyhzZWxmKToKICAgICAgICB0cnk6CiAgICAgICAgICAgIChzZWxmLl9ydC5jdWRhRGV2aWNlU3luY2hyb25pemUgaWYgc2VsZi5pbXBsID09ICJsaWJjdWRhcnQiCiAgICAgICAgICAgICBlbHNlIHNlbGYuX2Rydi5jdUN0eFN5bmNocm9uaXplKSgpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgcGFzcwoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBoZWFydGJlYXQgbW9uaXRvcgpjbGFzcyBNb25pdG9yKHRocmVhZGluZy5UaHJlYWQpOgogICAgIiIiQ3VtdWxhdGl2ZSBieXRlcyArIGluc3RhbnRhbmVvdXMgR2lCL3MgZXZlcnkgYGV2ZXJ5YCBzIGZvciB0aGUgRU5USVJFIGxlZyAocnVsZSA8PTE1cykuIiIiCgogICAgZGVmIF9faW5pdF9fKHNlbGYsIHNpbmssIGxlZywgY291bnRlciwgZXZlcnk9NS4wKToKICAgICAgICBzdXBlcigpLl9faW5pdF9fKGRhZW1vbj1UcnVlKQogICAgICAgIHNlbGYuc2luaywgc2VsZi5sZWcsIHNlbGYuYyA9IHNpbmssIGxlZywgY291bnRlcgogICAgICAgIHNlbGYuZXZlcnkgPSBldmVyeQogICAgICAgIHNlbGYuZXYgPSB0aHJlYWRpbmcuRXZlbnQoKQoKICAgIGRlZiBydW4oc2VsZik6CiAgICAgICAgdDAgPSB0aW1lLm1vbm90b25pYygpCiAgICAgICAgbGFzdF9iLCBsYXN0X3QgPSAwLCB0MAogICAgICAgIHdoaWxlIG5vdCBzZWxmLmV2LndhaXQoc2VsZi5ldmVyeSk6CiAgICAgICAgICAgIGIgPSBzZWxmLmNbMF0KICAgICAgICAgICAgbm93ID0gdGltZS5tb25vdG9uaWMoKQogICAgICAgICAgICBpbnN0ID0gKGIgLSBsYXN0X2IpIC8gR2lCIC8gbWF4KG5vdyAtIGxhc3RfdCwgMWUtOSkKICAgICAgICAgICAgc2VsZi5zaW5rLnBvc3QoIlslc10gJTYuMWZzICU5LjJmIEdpQiBjdW0gIGluc3QgJTYuM2YgR2lCL3MiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICUgKHNlbGYubGVnLCBub3cgLSB0MCwgYiAvIEdpQiwgaW5zdCkpCiAgICAgICAgICAgIGxhc3RfYiwgbGFzdF90ID0gYiwgbm93CgogICAgZGVmIHN0b3Aoc2VsZik6CiAgICAgICAgc2VsZi5ldi5zZXQoKQoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBjb2xkIG9wZW4gaGVscGVyCmRlZiBvcGVuX2NvbGQocGF0aCwgc2luayk6CiAgICAiIiJSZXR1cm4gKGZkLCBjb2xkX21ldGhvZCkuIE9fRElSRUNUIGlmIGEgcHJvYmUgcHJlYWQgd29ya3MsIGVsc2UgYnVmZmVyZWQrZmFkdmlzZS4iIiIKICAgIHRyeToKICAgICAgICBmZCA9IG9zLm9wZW4ocGF0aCwgb3MuT19SRE9OTFkgfCBnZXRhdHRyKG9zLCAiT19ESVJFQ1QiLCAwbzQwMDAwKSkKICAgICAgICB0cnk6CiAgICAgICAgICAgIG9zLnByZWFkKGZkLCA0MDk2LCAwKQogICAgICAgICAgICByZXR1cm4gZmQsICJvZGlyZWN0IgogICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgICAgICBvcy5jbG9zZShmZCkKICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgIHBhc3MKICAgIGZkID0gb3Mub3BlbihwYXRoLCBvcy5PX1JET05MWSkKICAgIHJldHVybiBmZCwgImJ1ZmZlcmVkK2ZhZHZpc2UoRE9OVE5FRUQpIgoKCmRlZiBhZHZpc2VfZG9udG5lZWQoZmQsIG9mZiwgbik6CiAgICB0cnk6CiAgICAgICAgb3MucG9zaXhfZmFkdmlzZShmZCwgb2ZmLCBuLCBvcy5QT1NJWF9GQURWX0RPTlRORUVEKQogICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgcGFzcwoKCmRlZiBkcm9wX2NhY2hlcyhzaW5rKToKICAgIHRyeToKICAgICAgICB3aXRoIG9wZW4oIi9wcm9jL3N5cy92bS9kcm9wX2NhY2hlcyIsICJ3IikgYXMgZjoKICAgICAgICAgICAgZi53cml0ZSgiMyIpCiAgICAgICAgc2luay5wb3N0KCJbY29sZF0gZHJvcF9jYWNoZXM9MyB3cml0dGVuIChyb290IGNoYW5uZWwpIikKICAgICAgICByZXR1cm4gImRyb3BfY2FjaGVzIgogICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgcmV0dXJuICJub25lIgoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBsZWdzCmRlZiBsZWdfaDJkKGFyZ3MsIHNpbmssIGN1ZGEpOgogICAgIiIiTDA6IHBpbm5lZCBSQU0gLT4gVlJBTSBjZWlsaW5nLiIiIgogICAgbmFtZSA9ICJMMF9oMmRfY2VpbGluZyIKICAgIGlmIGN1ZGEgaXMgTm9uZSBvciBub3QgY3VkYS5vazoKICAgICAgICByZXR1cm4geyJsZWciOiBuYW1lLCAic3RhdHVzIjogIlNLSVBQRUQiLCAicmVhc29uIjogIm5vIGxpYmN1ZGFydC9saWJjdWRhIChzZWUgUFJPQkUpIn0KICAgIHBpbl9naWIgPSBhcmdzLmwwX3Bpbl9naWIKICAgIG5ieXRlcyA9IHBpbl9naWIgKiBHaUIKICAgIHJ1bl9zID0gYXJncy5sMF9zZWNvbmRzCiAgICB0cnk6CiAgICAgICAgaG9zdCA9IGN1ZGEuaG9zdF9hbGxvYyhuYnl0ZXMpCiAgICAgICAgZGV2ID0gY3VkYS5kZXZfYWxsb2MobmJ5dGVzKQogICAgZXhjZXB0IFJ1bnRpbWVFcnJvciBhcyBlOgogICAgICAgIHJldHVybiB7ImxlZyI6IG5hbWUsICJzdGF0dXMiOiAiU0tJUFBFRCIsCiAgICAgICAgICAgICAgICAicmVhc29uIjogImFsbG9jIGZhaWxlZDogJXMiICUgZX0KICAgIGNudCA9IFswXQogICAgc2luay5wb3N0KCJbTDBdIHN0YXJ0OiAlZCBHaUIgcGlubmVkKCVzKSAtPiBWUkFNIGNvcGllcywgbWF4ICVkcyIgJSAocGluX2dpYiwgY3VkYS5pbXBsLCBydW5fcykpCiAgICBtb24gPSBNb25pdG9yKHNpbmssICJMMCIsIGNudCk7IG1vbi5zdGFydCgpCiAgICB0MCA9IHRpbWUubW9ub3RvbmljKCkKICAgIHRyeToKICAgICAgICB3aGlsZSB0aW1lLm1vbm90b25pYygpIC0gdDAgPCBydW5fczoKICAgICAgICAgICAgY3VkYS5jb3B5X2gyZChkZXYsIGhvc3QsIG5ieXRlcykKICAgICAgICAgICAgY250WzBdICs9IG5ieXRlcwogICAgICAgIGN1ZGEuc3luYygpCiAgICBmaW5hbGx5OgogICAgICAgIGVsID0gdGltZS5tb25vdG9uaWMoKSAtIHQwCiAgICAgICAgbW9uLnN0b3AoKQogICAgICAgIGN1ZGEuZGV2X2ZyZWUoZGV2KTsgY3VkYS5ob3N0X2ZyZWUoaG9zdCkKICAgIHJldHVybiB7ImxlZyI6IG5hbWUsICJzdGF0dXMiOiAiT0siLCAiYnl0ZXMiOiBjbnRbMF0sICJzZWMiOiByb3VuZChlbCwgMyksCiAgICAgICAgICAgICJnaWJfcGVyX3MiOiByb3VuZChjbnRbMF0gLyBHaUIgLyBtYXgoZWwsIDFlLTkpLCAzKSwKICAgICAgICAgICAgImltcGwiOiBjdWRhLmltcGwsICJwaW5fZ2liIjogcGluX2dpYiwKICAgICAgICAgICAgInJlZiI6ICJtZWFzdXJlZCBUNCBwYWdlYWJsZSA0LjgyIC8gcGlubmVkIDExLjQwIEdpQi9zIChSRVNVTFRTLm1kOjEwOCkifQoKCmRlZiBfY29weV9zaW5rX2xlZyhhcmdzLCBzaW5rLCBjdWRhLCBudGhyZWFkcywgbmFtZSwgdnJhbSk6CiAgICBwYXRoLCBDSCA9IGFyZ3MuZmlsZSwgYXJncy5jaHVua19taWIgKiAyICoqIDIwCiAgICBpZiBub3Qgb3MucGF0aC5leGlzdHMocGF0aCk6CiAgICAgICAgcmV0dXJuIHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJTS0lQUEVEIiwgInJlYXNvbiI6ICJubyAlcyAocnVuIDAxX0ZJTEwuc2gpIiAlIHBhdGh9CiAgICB0b3RhbCA9IG9zLnBhdGguZ2V0c2l6ZShwYXRoKQogICAgbmNodW5rcyA9ICh0b3RhbCArIENIIC0gMSkgLy8gQ0gKICAgIGNudCA9IFswXQogICAgZXJycyA9IFtdCiAgICBwaW5uZWQgPSB2cmFtIGFuZCBjdWRhIGlzIG5vdCBOb25lIGFuZCBjdWRhLm9rCiAgICBpZiB2cmFtIGFuZCBub3QgcGlubmVkOgogICAgICAgIHJldHVybiB7ImxlZyI6IG5hbWUsICJzdGF0dXMiOiAiU0tJUFBFRCIsICJyZWFzb24iOiAibm8gQ1VEQSBydW50aW1lIChzZWUgUFJPQkUpIn0KICAgICMgYnVmZmVyczogb25lIHBpbm5lZCBzbGFiIChudGhyZWFkcyAqIENIKSArIHBlci10aHJlYWQgZGV2aWNlIHNsaWNlLCBvciBwbGFpbiBieXRlYXJyYXkKICAgIGhvc3Rfc2xhYiA9IGhvc3RfcHRyID0gTm9uZQogICAgZGV2X3B0cnMgPSBbXQogICAgaWYgcGlubmVkOgogICAgICAgIHRyeToKICAgICAgICAgICAgaG9zdF9wdHIgPSBjdWRhLmhvc3RfYWxsb2MobnRocmVhZHMgKiBDSCkKICAgICAgICAgICAgZGV2X3B0cnMgPSBbY3VkYS5kZXZfYWxsb2MoQ0gpIGZvciBfIGluIHJhbmdlKG50aHJlYWRzKV0KICAgICAgICBleGNlcHQgUnVudGltZUVycm9yIGFzIGU6CiAgICAgICAgICAgIGZvciBwIGluIGRldl9wdHJzOgogICAgICAgICAgICAgICAgY3VkYS5kZXZfZnJlZShwKQogICAgICAgICAgICByZXR1cm4geyJsZWciOiBuYW1lLCAic3RhdHVzIjogIlNLSVBQRUQiLCAicmVhc29uIjogImFsbG9jOiAlcyIgJSBlfQogICAgZWxpZiB2cmFtIGlzIEZhbHNlIGFuZCBjdWRhIGlzIG5vdCBOb25lIGFuZCBjdWRhLm9rOgogICAgICAgIHRyeTogICMgaG9zdC1zaW5rIG1vZGUgYnV0IHBpbm5lZCBSQU0gc3RpbGwgcG9zc2libGUKICAgICAgICAgICAgaG9zdF9wdHIgPSBjdWRhLmhvc3RfYWxsb2MobnRocmVhZHMgKiBDSCkKICAgICAgICBleGNlcHQgUnVudGltZUVycm9yOgogICAgICAgICAgICBob3N0X3B0ciA9IE5vbmUKICAgIHBsYWluID0gTm9uZSBpZiBob3N0X3B0ciBlbHNlIGJ5dGVhcnJheShudGhyZWFkcyAqIENIKQogICAgZmQsIGNvbGQgPSBvcGVuX2NvbGQocGF0aCwgc2luaykKICAgIHVzZV9jaGVja3N1bSA9IGFyZ3MuY2hlY2tzdW0KICAgIGlmIHVzZV9jaGVja3N1bToKICAgICAgICB0cnk6CiAgICAgICAgICAgIGltcG9ydCBudW1weSBhcyBucCAgIyBvcHRpb25hbAogICAgICAgIGV4Y2VwdCBJbXBvcnRFcnJvcjoKICAgICAgICAgICAgdXNlX2NoZWNrc3VtID0gRmFsc2UKICAgIG1ldGhvZF9leHRyYSA9ICgicGlubmVkKCVzKSIgJSBjdWRhLmltcGwgaWYgaG9zdF9wdHIgZWxzZSAicGFnZWFibGUiKSBcCiAgICAgICAgKyAoIi9WUkFNIiBpZiB2cmFtIGVsc2UgIi9ob3N0LXNpbmsiKQogICAgc2luay5wb3N0KCJbJXNdIHN0YXJ0OiAlLjFmIEdpQiBmaWxlLCAlZCBzdHJlYW1zIHggJWQgTWlCIGNodW5rcywgJXMsIGNvbGQ9JXMiCiAgICAgICAgICAgICAgJSAobmFtZSwgdG90YWwgLyBHaUIsIG50aHJlYWRzLCBhcmdzLmNodW5rX21pYiwgbWV0aG9kX2V4dHJhLCBjb2xkKSkKCiAgICBkZWYgd29ya2VyKHRpZCk6CiAgICAgICAgY3N1bSA9IDAKICAgICAgICB0cnk6CiAgICAgICAgICAgIGZvciBrIGluIHJhbmdlKHRpZCwgbmNodW5rcywgbnRocmVhZHMpOgogICAgICAgICAgICAgICAgb2ZmID0gayAqIENICiAgICAgICAgICAgICAgICB3YW50ID0gbWluKENILCB0b3RhbCAtIG9mZikKICAgICAgICAgICAgICAgIGRhdGEgPSBvcy5wcmVhZChmZCwgd2FudCwgb2ZmKQogICAgICAgICAgICAgICAgZ290ID0gbGVuKGRhdGEpCiAgICAgICAgICAgICAgICBpZiBnb3QgPT0gMDoKICAgICAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICAgICAgaWYgY29sZCA9PSAiYnVmZmVyZWQrZmFkdmlzZShET05UTkVFRCkiOgogICAgICAgICAgICAgICAgICAgIGFkdmlzZV9kb250bmVlZChmZCwgb2ZmLCBnb3QpCiAgICAgICAgICAgICAgICBpZiB1c2VfY2hlY2tzdW06CiAgICAgICAgICAgICAgICAgICAgY3N1bSArPSBpbnQobnAuZnJvbWJ1ZmZlcihkYXRhLCBkdHlwZT1ucC51aW50OCkuc3VtKGR0eXBlPW5wLmludDY0KSkKICAgICAgICAgICAgICAgIGlmIGhvc3RfcHRyOgogICAgICAgICAgICAgICAgICAgIGN0eXBlcy5tZW1tb3ZlKGN0eXBlcy5jX3ZvaWRfcChob3N0X3B0ci52YWx1ZSArIHRpZCAqIENIKSwgZGF0YSwgZ290KQogICAgICAgICAgICAgICAgICAgIGlmIHZyYW06CiAgICAgICAgICAgICAgICAgICAgICAgIGN1ZGEuY29weV9oMmQoZGV2X3B0cnNbdGlkXSwgY3R5cGVzLmNfdm9pZF9wKGhvc3RfcHRyLnZhbHVlICsgdGlkICogQ0gpLCBnb3QpCiAgICAgICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgICAgIHBsYWluW3RpZCAqIENIOiB0aWQgKiBDSCArIGdvdF0gPSBkYXRhCiAgICAgICAgICAgICAgICBjbnRbMF0gKz0gZ290CiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOiAgIyBub3FhOiBCTEUwMDEgLSBvbmUgc3RyZWFtJ3MgZXJyb3IgbXVzdCBub3Qga2lsbCB0aGUgbGVnCiAgICAgICAgICAgIGVycnMuYXBwZW5kKCJ0JWQ6ICVyIiAlICh0aWQsIGUpKQogICAgICAgIHJldHVybiBjc3VtCgogICAgbW9uID0gTW9uaXRvcihzaW5rLCBuYW1lLCBjbnQpOyBtb24uc3RhcnQoKQogICAgdDAgPSB0aW1lLm1vbm90b25pYygpCiAgICB0aHJlYWRzID0gW3RocmVhZGluZy5UaHJlYWQodGFyZ2V0PXdvcmtlciwgYXJncz0oaSwpKSBmb3IgaSBpbiByYW5nZShudGhyZWFkcyldCiAgICBmb3IgdCBpbiB0aHJlYWRzOgogICAgICAgIHQuc3RhcnQoKQogICAgZm9yIHQgaW4gdGhyZWFkczoKICAgICAgICB0LmpvaW4oKQogICAgaWYgcGlubmVkOgogICAgICAgIGN1ZGEuc3luYygpCiAgICBlbCA9IHRpbWUubW9ub3RvbmljKCkgLSB0MAogICAgbW9uLnN0b3AoKQogICAgb3MuY2xvc2UoZmQpCiAgICBmb3IgcCBpbiBkZXZfcHRyczoKICAgICAgICBjdWRhLmRldl9mcmVlKHApCiAgICBpZiBob3N0X3B0cjoKICAgICAgICBjdWRhLmhvc3RfZnJlZShob3N0X3B0cikKICAgIHJlcyA9IHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJGQUlMRUQiIGlmIGVycnMgZWxzZSAiT0siLAogICAgICAgICAgICJieXRlcyI6IGNudFswXSwgInNlYyI6IHJvdW5kKGVsLCAzKSwKICAgICAgICAgICAiZ2liX3Blcl9zIjogcm91bmQoY250WzBdIC8gR2lCIC8gbWF4KGVsLCAxZS05KSwgMyksCiAgICAgICAgICAgInN0cmVhbXMiOiBudGhyZWFkcywgImNodW5rX21pYiI6IGFyZ3MuY2h1bmtfbWliLAogICAgICAgICAgICJjb2xkX21ldGhvZCI6IGNvbGQsICJwYXRoIjogbWV0aG9kX2V4dHJhLCAiaG9zdCI6IHNpbmsuaG9zdH0KICAgIGlmIGVycnM6CiAgICAgICAgcmVzWyJlcnJvcnMiXSA9IGVycnNbOjRdCiAgICByZXR1cm4gcmVzCgoKZGVmIGxlZ19rdmlraW8oYXJncywgc2luaywgY3VkYSk6CiAgICBuYW1lID0gIkwzX2t2aWtpbyIKICAgIHRyeToKICAgICAgICBpbXBvcnQgY3VweSBhcyBjcAogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOiAgIyBub3FhOiBCTEUwMDEKICAgICAgICByZXR1cm4geyJsZWciOiBuYW1lLCAic3RhdHVzIjogIlNLSVBQRUQiLCAicmVhc29uIjogImN1cHkgbm90IGltcG9ydGFibGUgKCVzKSIgJSB0eXBlKGUpLl9fbmFtZV9ffQogICAgdHJ5OgogICAgICAgIGltcG9ydCBrdmlraW8KICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogICMgbm9xYTogQkxFMDAxCiAgICAgICAgcmV0dXJuIHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJTS0lQUEVEIiwgInJlYXNvbiI6ICJrdmlraW8gbm90IGltcG9ydGFibGUgKCVzKSIgJSB0eXBlKGUpLl9fbmFtZV9ffQogICAgaWYgbm90IG9zLnBhdGguZXhpc3RzKGFyZ3MuZmlsZSk6CiAgICAgICAgcmV0dXJuIHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJTS0lQUEVEIiwgInJlYXNvbiI6ICJubyAlcyIgJSBhcmdzLmZpbGV9CiAgICBDSCA9IGFyZ3MuY2h1bmtfbWliICogMiAqKiAyMAogICAgdG90YWwgPSBvcy5wYXRoLmdldHNpemUoYXJncy5maWxlKQogICAgY250ID0gWzBdCiAgICBzaW5rLnBvc3QoIltMM10gc3RhcnQ6IGt2aWtpbyAlcyAvIGN1cHkgJXMsIHdob2xlIGZpbGUgJS4xZiBHaUIiCiAgICAgICAgICAgICAgJSAoZ2V0YXR0cihrdmlraW8sICJfX3ZlcnNpb25fXyIsICI/IiksIGdldGF0dHIoY3AsICJfX3ZlcnNpb25fXyIsICI/IiksIHRvdGFsIC8gR2lCKSkKCiAgICBkZWYgcnVuX2N1ZmlsZSgpOgogICAgICAgICMgQ3VGaWxlIChHRFMgQVBJOyBvbiBHQ0UgcnVucyBpbiBjb21wYXQgbW9kZSDigJQgdGhhdCBpcyBpdHNlbGYgYSBtZWFzdXJlZCBkYXRhcG9pbnQsCiAgICAgICAgIyBHRFMtdW5hdmFpbGFibGUgdmVyZGljdDogcmVzZWFyY2gvc3RvcmFnZS1pby1nZHMubWQ6OTkpCiAgICAgICAgZiA9IGt2aWtpby5DdUZpbGUoYXJncy5maWxlLCBmbGFncz1vcy5PX1JET05MWSkKICAgICAgICB0cnk6CiAgICAgICAgICAgIGJ1ZiA9IGNwLmVtcHR5KENILCBkdHlwZT1jcC51aW50OCkKICAgICAgICAgICAgb2ZmID0gMAogICAgICAgICAgICB3aGlsZSBvZmYgPCB0b3RhbDoKICAgICAgICAgICAgICAgIG4gPSBmLnJlYWQoYnVmLCBtaW4oQ0gsIHRvdGFsIC0gb2ZmKSwgZmlsZV9vZmZzZXQ9b2ZmKQogICAgICAgICAgICAgICAgb2ZmICs9IGludChuKQogICAgICAgICAgICAgICAgY250WzBdID0gb2ZmCiAgICAgICAgZmluYWxseToKICAgICAgICAgICAgZi5jbG9zZSgpCgogICAgZGVmIHJ1bl9wcmVhZCgpOgogICAgICAgICMga3Zpa2lvIHBvc2l4IGJhdGNoZWQgcHJlYWQgKGRlZXAgcXVldWUpIGludG8gYSBkZXZpY2UgYnVmZmVyIGlmIGV4cG9zZWQKICAgICAgICBpbXBvcnQga3Zpa2lvLnBvc2l4X2lvIGFzIHBpbyAgIyBvbGRlciBBUEkgbGF5b3V0IG1heSBkaWZmZXI7IGd1YXJkZWQgYnkgY2FsbGVyIHRyeQogICAgICAgIHJhaXNlIE5vdEltcGxlbWVudGVkRXJyb3IoIkFQSSBzaGFwZSB2YXJpZXMgYnkga3Zpa2lvIHZlcnNpb247IEN1RmlsZSBsZWcgaXMgdGhlIG1lYXN1cmVkIG9uZSIpCgogICAgbW9uID0gTW9uaXRvcihzaW5rLCAiTDMiLCBjbnQpOyBtb24uc3RhcnQoKQogICAgdDAgPSB0aW1lLm1vbm90b25pYygpCiAgICBlcnIgPSBOb25lCiAgICB0cnk6CiAgICAgICAgcnVuX2N1ZmlsZSgpCiAgICAgICAgY3AuY3VkYS5nZXRfY3VycmVudF9zdHJlYW0oKS5zeW5jaHJvbml6ZSgpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6ICAjIG5vcWE6IEJMRTAwMQogICAgICAgIGVyciA9IHJlcHIoZSkKICAgICAgICB0cnk6CiAgICAgICAgICAgIGNudFswXSA9IDAKICAgICAgICAgICAgcnVuX3ByZWFkKCkKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGUyOiAgIyBub3FhOiBCTEUwMDEKICAgICAgICAgICAgZXJyICs9ICIgfCBwcmVhZDogJXIiICUgZTIKICAgIGVsID0gdGltZS5tb25vdG9uaWMoKSAtIHQwCiAgICBtb24uc3RvcCgpCiAgICBpZiBlcnIgYW5kIGNudFswXSA9PSAwOgogICAgICAgIHJldHVybiB7ImxlZyI6IG5hbWUsICJzdGF0dXMiOiAiU0tJUFBFRCIsICJyZWFzb24iOiAicnVudGltZTogJXMiICUgZXJyfQogICAgcmV0dXJuIHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJGQUlMRUQiIGlmIGVyciBlbHNlICJPSyIsCiAgICAgICAgICAgICJieXRlcyI6IGNudFswXSwgInNlYyI6IHJvdW5kKGVsLCAzKSwKICAgICAgICAgICAgImdpYl9wZXJfcyI6IHJvdW5kKGNudFswXSAvIEdpQiAvIG1heChlbCwgMWUtOSksIDMpLAogICAgICAgICAgICAiaG9zdCI6IHNpbmsuaG9zdCwgIm5vdGUiOiAiY29tcGF0LW1vZGUgZXhwZWN0ZWQgb24gR0NFIn0KCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gbWFpbgpkZWYgbWFpbigpOgogICAgYXAgPSBhcmdwYXJzZS5Bcmd1bWVudFBhcnNlcihkZXNjcmlwdGlvbj0idDQgc3RyaXBlZC1hcnJheSAtPiBWUkFNIGJlbmNoIChyYXcgR2lCL3MpIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1maWxlIiwgZGVmYXVsdD0iL21udC9yYWlkL2JlbmNoZmlsZSIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tY2h1bmstbWliIiwgdHlwZT1pbnQsIGRlZmF1bHQ9OCwgY2hvaWNlcz0oNCwgOCkpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tc3RyZWFtcyIsIHR5cGU9aW50LCBkZWZhdWx0PTgpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tbGVncyIsIGRlZmF1bHQ9IkwwLEwxLEwyLEwzIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1sMC1waW4tZ2liIiwgdHlwZT1pbnQsIGRlZmF1bHQ9NCkKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1sMC1zZWNvbmRzIiwgdHlwZT1pbnQsIGRlZmF1bHQ9NDUpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tY2hlY2tzdW0iLCBhY3Rpb249InN0b3JlX3RydWUiLAogICAgICAgICAgICAgICAgICAgIGhlbHA9InN1bSBieXRlcyBvZiBmaXJzdCBsZWcgY2h1bmtzIChuZWVkcyBudW1weTsgYXV0by1vZmYgd2l0aG91dCBpdCkiKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLW5vLXNpbmsiLCBhY3Rpb249InN0b3JlX3RydWUiKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXNpbmstcG9ydCIsIHR5cGU9aW50LCBkZWZhdWx0PTE4ODg4KQogICAgYXAuYWRkX2FyZ3VtZW50KCItLW91dCIsIGRlZmF1bHQ9Ii90bXAvYmVuY2hfdDRfcmVzdWx0Lmpzb24iKQogICAgYXJncyA9IGFwLnBhcnNlX2FyZ3MoKQoKICAgIHNpbmsgPSBTaW5rKGVuYWJsZWQ9bm90IGFyZ3Mubm9fc2luaywgcG9ydD1hcmdzLnNpbmtfcG9ydCkKICAgIGxlZ3MgPSBbcy5zdHJpcCgpLnVwcGVyKCkgZm9yIHMgaW4gYXJncy5sZWdzLnNwbGl0KCIsIikgaWYgcy5zdHJpcCgpXQoKICAgIGRlZiBsb2cobSk6CiAgICAgICAgc2luay5wb3N0KCJbaW5pdF0gIiArIG0pCgogICAgbG9nKCJob3N0PSVzIGZpbGU9JXMgc2l6ZT0lLjFmIEdpQiBsZWdzPSVzIGNodW5rPSVkTWlCIHN0cmVhbXM9JWQiCiAgICAgICAgJSAoc2luay5ob3N0LCBhcmdzLmZpbGUsCiAgICAgICAgICAgKG9zLnBhdGguZ2V0c2l6ZShhcmdzLmZpbGUpIC8gR2lCKSBpZiBvcy5wYXRoLmV4aXN0cyhhcmdzLmZpbGUpIGVsc2UgLTEsCiAgICAgICAgICAgIiwiLmpvaW4obGVncyksIGFyZ3MuY2h1bmtfbWliLCBhcmdzLnN0cmVhbXMpKQogICAgbG9nKCJweXRob249JXMiICUgc3lzLnZlcnNpb24uc3BsaXQoKVswXSkKCiAgICBjdWRhID0gQ3VkYShsb2cpCiAgICBsb2coImN1ZGE6ICVzIiAlIChjdWRhLmltcGwgaWYgY3VkYS5vayBlbHNlCiAgICAgICAgICAgICAgICAgICAgICAiTk9ORSAobGliY3VkYXJ0L2xpYmN1ZGEgbm90IGxvYWRhYmxlIC0+IFZSQU0gbGVncyBTS0lQUEVELCBMMS9MMiBsYW5kIGluIGhvc3QgUkFNKSIpKQoKICAgIHJlc3VsdHMgPSBbXQoKICAgIGRlZiBydW4obGVnX2lkLCBmbik6CiAgICAgICAgZHJvcCA9IGRyb3BfY2FjaGVzKHNpbmspCiAgICAgICAgdCA9IGZuKCkKICAgICAgICB0LnNldGRlZmF1bHQoImNvbGRfcHJlcCIsIGRyb3ApCiAgICAgICAgdFsiaG9zdCJdID0gdC5nZXQoImhvc3QiLCBzaW5rLmhvc3QpCiAgICAgICAgcmVzdWx0cy5hcHBlbmQodCkKICAgICAgICBzaW5rLnBvc3QoIlJFU1VMVF9KU09OICIgKyBqc29uLmR1bXBzKHQsIHNvcnRfa2V5cz1UcnVlKSkKCiAgICBpZiAiTDAiIGluIGxlZ3M6CiAgICAgICAgcnVuKCJMMCIsIGxhbWJkYTogbGVnX2gyZChhcmdzLCBzaW5rLCBjdWRhKSkKICAgIGlmICJMMSIgaW4gbGVnczoKICAgICAgICBydW4oIkwxIiwgbGFtYmRhOiBfY29weV9zaW5rX2xlZyhhcmdzLCBzaW5rLCBjdWRhLCAxLCAiTDFfY29sZF8xc3RyZWFtIiwgdnJhbT1jdWRhLm9rKSkKICAgIGlmICJMMiIgaW4gbGVnczoKICAgICAgICBydW4oIkwyIiwgbGFtYmRhOiBfY29weV9zaW5rX2xlZyhhcmdzLCBzaW5rLCBjdWRhLCBhcmdzLnN0cmVhbXMsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIkwyXyVkc3RyZWFtcyIgJSBhcmdzLnN0cmVhbXMsIHZyYW09Y3VkYS5vaykpCiAgICBpZiAiTDMiIGluIGxlZ3M6CiAgICAgICAgcnVuKCJMMyIsIGxhbWJkYTogbGVnX2t2aWtpbyhhcmdzLCBzaW5rLCBjdWRhKSkKCiAgICBzaW5rLnBvc3QoIlJFU1VMVF9KU09OX0FMTCAiICsganNvbi5kdW1wcyhyZXN1bHRzLCBzb3J0X2tleXM9VHJ1ZSkpCiAgICB0cnk6CiAgICAgICAgd2l0aCBvcGVuKGFyZ3Mub3V0LCAidyIpIGFzIGY6CiAgICAgICAgICAgIGpzb24uZHVtcCh7Imhvc3QiOiBzaW5rLmhvc3QsICJyZXN1bHRzIjogcmVzdWx0c30sIGYsIGluZGVudD0xKQogICAgZXhjZXB0IE9TRXJyb3IgYXMgZToKICAgICAgICBzaW5rLnBvc3QoIltvdXRdIGNvdWxkIG5vdCB3cml0ZSAlczogJXIiICUgKGFyZ3Mub3V0LCBlKSkKICAgIHNpbmsucG9zdCgiVDRCRU5DSF9ET05FICVzIiAlIHNpbmsuaG9zdCkKICAgIGJhZCA9IFtyIGZvciByIGluIHJlc3VsdHMgaWYgci5nZXQoInN0YXR1cyIpID09ICJGQUlMRUQiXQogICAgc3lzLmV4aXQoMSBpZiBiYWQgZWxzZSAwKQoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICBtYWluKCkK").decode()
+FR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRiLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRiLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNEJfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRCX0xBVU5DSEVEICRIIFM9JFMiCnB5dGhvbjMgL3RtcC9iZW5jaF90NC5weSAtLWxlZ3MgTDAsTDEsTDIsTDMgLS1jaHVuay1taWIgOCAtLXN0cmVhbXMgOCA+PiAvdG1wL3Q0Yi5vdXQgMj4mMQpwb3N0ICJUNEJfRVhJVCAkSCByYz0kPyB0YWlsOiAkKHRhaWwgLWMgMzAwIC90bXAvdDRiLm91dCkiCg==").decode()
+SFX = "%04x" % random.randrange(65536)
+_fq = socket.getfqdn()
+if "." not in _fq:
+    _d = subprocess.run("hostname -d", shell=True, capture_output=True, text=True).stdout.strip()
+    _fq = socket.gethostname().split(".")[0] + "." + _d if _d else socket.gethostname().split(".")[0]
+MGRFQ = _fq
+def __t4_launch():
+    h = socket.gethostname().split(".")[0]
+    open("/tmp/bench_t4.py", "w").write(PAY)
+    open("/tmp/t4b-fr.sh", "w").write(FR)
+    # RESOLVE bash, don't assume it: executors ARE host processes, so shutil.which("bash") here
+    # returns the host's own bash -> the exact file visible at /host<that path> once / is mounted.
+    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian's /bin/bash.
+    import shutil
+    _b = shutil.which("bash") or subprocess.run(
+        "find / -maxdepth 4 \( -path /proc -o -path /sys -o -path /var/lib/docker \) -prune "
+        "-o -name bash -type f -print 2>/dev/null | head -1",
+        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"
+    HB = "/host" + _b
+    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"
+                   " || tar -c --files-from /dev/null | docker import - emptyimg",
+                   shell=True, capture_output=True, timeout=60)
+    r = subprocess.run("docker run -d --name t4b-" + SFX + "-" + h +
+                       " --privileged --pid=host --uts=host --network=host --ipc=host "
+                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "
+                       + HB + " -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4b-fr.sh " + SFX + "'",
+                       shell=True, capture_output=True, text=True)
+    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]
+
+if not __preflight():
+    print("PREFLIGHT FAIL: sink not answering on :18888 -> restart kernel, run this file from C0.", flush=True)
+else:
+    print("PREFLIGHT_OK sink alive", time.strftime("%H:%M:%S"), flush=True)
+    __sc = globals().get("sc")
+    __live = False
+    if __sc is not None:
+        try:
+            __live = (__sc.parallelize([1], 1).count() == 1)
+        except Exception:
+            __live = False
+    if __live:
+        print("MODE: session", flush=True)
+        for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
+            print("WL:", x[:250], flush=True)
+    else:
+        print("MODE: spark-submit fallback (no live session -> if AFTER C2, contract broken: restart kernel, run from C0; costs 1-3 min)", flush=True)
+        JOB = 'import base64, socket, subprocess, os\nPAY = base64.b64decode("IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJpb190NCAvIDAyX2JlbmNoX3N0b3JhZ2VfdG9fZ3B1LnB5IOKAlCBzdHJpcGVkLWFycmF5IC0+IFZSQU0gYmVuY2gsIFRIRSBkZWxpdmVyYWJsZS4KClJVTiBBUzogcm9vdCAob3IgYW55IHVzZXIgd2l0aCAvZGV2L252aWRpYSogYWNjZXNzKSBvbiBhIHQ0LWlvMSBEYXRhcHJvYyB3b3JrZXIgdGhhdAphbHJlYWR5IGhhcyAvbW50L3JhaWQgKDAwX1JPT1RfU0VUVVAuc2gpIGFuZCAvbW50L3JhaWQvYmVuY2hmaWxlICgwMV9GSUxMLnNoKSwgdmlhIHRoZQpkb2NrZXIrbnNlbnRlciBwYXN0ZSBjZWxsIGdlbmVyYXRlZCBieSBtYWtlX3Bhc3RlX2NlbGwucHkgKFJVTkJPT0subWQpLiBIZWFydGJlYXRzIGdvIHRvCnRoZSBtYW5hZ2VyIHNpbmsgKDoxODg4OCkgQU5EIHN0ZG91dDsgcGVyLWxlZyByZXN1bHQgbGluZXMgbG9vayBsaWtlOgoKICAgIFJFU1VMVF9KU09OIHsibGVnIjogIkwyIiwgImJ5dGVzIjogLi4uLCAic2VjIjogLi4uLCAiZ2liX3Blcl9zIjogLi4uLCAuLi59CgpSRVBPUlQgUkFXIEdpQi9zIE9OTFkgKEFHRU5UUy5tZCBJTyBydWxlIC8gUkVTVUxUUy5tZCDCpzM0KTogbm8gZW5jb2RpbmctYWRqdXN0ZWQgbnVtYmVycy4KCkxlZ3MgKGNodW5rIGRlZmF1bHQgOCBNaUIsIGFsbCByZWFkcyBhcmUgV0hPTEUtRklMRSBwZXIgcGFzcyk6CiAgTDAgIEgyRCBjZWlsaW5nICAgICAgICA6IHBpbm5lZCBob3N0IGJ1ZmZlciAoNCBHaUIpIC0+IGN1ZGFNZW1jcHkgLT4gb25lIFZSQU0gYnVmZmVyLCBsb29wLgogIEwxICBjb2xkIHNpbmdsZSBzdHJlYW0gOiBPX0RJUkVDVCBwcmVhZCA0LzggTWlCIC0+IHBpbm5lZCBob3N0IGJ1ZmZlciAtPiBtZW1jcHkgLT4gVlJBTS4KICBMMiAgOCBwYXJhbGxlbCBzdHJlYW1zIDogc2FtZSBhcyBMMSB3aXRoIE4gdGhyZWFkcyBvdmVyIGRpc2pvaW50IHJhbmdlcyAoZGVlcCBxdWV1ZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgdGhlIHNoYXBlIHRoYXQgaGl0IDYuMS02LjcgR2lCL3MgZGlzay1zaWRlOiBSRVNVTFRTLm1kOjU5My01OTkpLgogIEwzICBrdmlraW8gICAgICAgICAgICA6IG9ubHkgaWYgY3VweSBBTkQga3Zpa2lvIGltcG9ydGFibGUgKGxpa2VseSBOT1Qgb24gdGhpcyBpbWFnZSDigJQKICAgICAgICAgICAgICAgICAgICAgICAgICAgbm8gaW50ZXJuZXQgb24gd29ya2Vycywgbm8gcGlwIGluc3RhbGxzIGFsbG93ZWQgaGVyZSkuCgpXaGVlbCBuZWVkcyAoZG9jdW1lbnRlZCwgTk9UIGluc3RhbGxlZCBieSB0aGlzIHNjcmlwdCk6CiAgLSBub3RoaW5nIGZvciBMMC9MMS9MMjogcHVyZSBzdGRsaWIgKyBjdHlwZXMgYWdhaW5zdCBkcml2ZXIvbGliY3VkYXJ0IEFMUkVBRFkgb24gdGhlIGltYWdlLgogICAgbGliY3VkYXJ0IHNlYXJjaCBvcmRlcjogY3R5cGVzLnV0aWwgLT4gbGliY3VkYXJ0LnNvLjEyLy5zby4xMyAtPiAvdXNyL2xvY2FsL2N1ZGEvbGliNjQvLi4uCiAgICBGYWxsYmFjazogbGliY3VkYS5zby4xIChkcml2ZXIgQVBJLCBwcmVzZW50IGlmZiBudmlkaWEtc21pIHdvcmtzKS4KICAtIEwzIG9ubHk6IGN1cHktY3VkYTEyeCArIGt2aWtpbyAod2hlZWxzIHdvdWxkIGhhdmUgdG8gYmUgcHJlLXN0YWdlZCB2aWEgZ3M6Ly8gKyBnc3V0aWw7CiAgICBuZXZlciBkb25lIG9uIERhdGFwcm9jIHdvcmtlcnMgaW4gdGhpcyBwcm9qZWN0IOKAlCB0cmVhdCBMMyBhcyBleHBlY3RlZC1TS0lQUEVEKS4KICAtIG51bXB5OiBvcHRpb25hbCwgaW1wb3J0ZWQgb25seSBmb3IgYW4gTDEgZmlyc3QtY2h1bmsgY2hlY2tzdW07IGFic2VuY2UgaXMgZmluZS4KCkdyYWNlZnVsIGRlZ3JhZGF0aW9uIChzcGVjKTogaWYgbm8gQ1VEQSBydW50aW1lIGNhbiBiZSBsb2FkZWQsIEwxL0wyIHN0aWxsIHJ1biBidXQgbGFuZCBpbgpwbGFpbiBob3N0IFJBTSAocGlubmVkIHZpYSBsaWJjdWRhcnQgaWYgb25seSB0aGF0IHdvcmtzOyBlbHNlIG5vcm1hbCBtZW1vcnkpIGFuZCBMMC9MMyBhcmUKcmVwb3J0ZWQgU0tJUFBFRCB3aXRoIHJlYXNvbiAtPiB3ZSBzdGlsbCBsZWFybiB0aGUgZGlzay1zaWRlIHZzIEdQVS1zaWRlIHNwbGl0LgoKQ29sZG5lc3M6IGxlZ3Mgb3BlbiB0aGUgZmlsZSBPX0RJUkVDVCB3aGVuIHRoZSBrZXJuZWwgYWNjZXB0cyBpdCAocHJvYmUgYXQgc3RhcnQpOyBvdGhlcndpc2UKYnVmZmVyZWQgKyBQT1NJWF9GQURWX0RPTlRORUVEIHBlciBjaHVuayAodGhlIHYyN2IgcGF0dGVybikuIGRyb3BfY2FjaGVzIGlzIGF0dGVtcHRlZCBiZXR3ZWVuCmxlZ3MgKHdlIGFyZSByb290IHZpYSB0aGUgbnNlbnRlciBjaGFubmVsLCB1bmxpa2UgdGhlIG9sZCBhcHAgVk0pLiBjb2xkX21ldGhvZCBpcyByZWNvcmRlZCBpbgpldmVyeSByZXN1bHQgbGluZS4gVGltZXI6IHRpbWUubW9ub3RvbmljLCBubyBwb2xsaW5nIHF1YW50aXphdGlvbi4KIiIiCgppbXBvcnQgYXJncGFyc2UKaW1wb3J0IGN0eXBlcwppbXBvcnQgY3R5cGVzLnV0aWwKaW1wb3J0IGpzb24KaW1wb3J0IG9zCmltcG9ydCByZQppbXBvcnQgc29ja2V0CmltcG9ydCBzdWJwcm9jZXNzCmltcG9ydCBzeXMKaW1wb3J0IHRocmVhZGluZwppbXBvcnQgdGltZQppbXBvcnQgdXJsbGliLnJlcXVlc3QKCkdpQiA9IDIgKiogMzAKCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gc2luayBjaGFubmVsCmNsYXNzIFNpbms6CiAgICAiIiJTYW1lIHRyaWNrIGFzIHRoZSBsaXZlLXJ1biBjZWxsczogUE9TVCBsaW5lcyB0byB0aGUgbWFuYWdlciBKdXB5dGVyLWtlcm5lbCBsaXN0ZW5lci4iIiIKCiAgICBkZWYgX19pbml0X18oc2VsZiwgZW5hYmxlZD1UcnVlLCBwb3J0PTE4ODg4KToKICAgICAgICBzZWxmLmVuYWJsZWQgPSBlbmFibGVkCiAgICAgICAgc2hvcnQgPSBzb2NrZXQuZ2V0aG9zdG5hbWUoKQogICAgICAgIHRyeToKICAgICAgICAgICAgZG9tID0gc3VicHJvY2Vzcy5ydW4oWyJob3N0bmFtZSIsICItZCJdLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHRpbWVvdXQ9MTApLnN0ZG91dC5zdHJpcCgpLnJzdHJpcCgiLiIpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgZG9tID0gIiIKICAgICAgICBtZ3IgPSAocmUuc3ViKHIiLXctXGQrJCIsICItbSIsIHNob3J0KSArICIuIiArIGRvbSkgaWYgZG9tIGVsc2Ugc2hvcnQKICAgICAgICBzZWxmLmhvc3QgPSBzaG9ydAogICAgICAgIHNlbGYudXJsID0gImh0dHA6Ly8lczolZC90NGJlbmNoLSVzIiAlIChtZ3IsIHBvcnQsIHNob3J0KQoKICAgIGRlZiBwb3N0KHNlbGYsIGxpbmUpOgogICAgICAgIHByaW50KGxpbmUsIGZsdXNoPVRydWUpCiAgICAgICAgaWYgbm90IHNlbGYuZW5hYmxlZDoKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgdHJ5OgogICAgICAgICAgICByZXEgPSB1cmxsaWIucmVxdWVzdC5SZXF1ZXN0KHNlbGYudXJsLCBkYXRhPWxpbmUuZW5jb2RlKCksIG1ldGhvZD0iUE9TVCIpCiAgICAgICAgICAgIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4ocmVxLCB0aW1lb3V0PTUpLnJlYWQoKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MgICMgc2luayBvcHRpb25hbDsgc3Rkb3V0IHN0aWxsIHNob3dzIGV2ZXJ5dGhpbmcgZm9yIHRoZSBmZXRjaCBjZWxsCgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tIENVREEgc2hpbQpjbGFzcyBDdWRhOgogICAgIiIiVGlueSBjdHlwZXMgc2hpbTogcHJlZmVycyBsaWJjdWRhcnQsIGZhbGxzIGJhY2sgdG8gbGliY3VkYSAoZHJpdmVyIEFQSSkuCgogICAgRXhwb3NlczogLm9rLCAuaW1wbCwgaG9zdF9hbGxvYyhuKS0+cHRyLCBob3N0X2ZyZWUocCksIGRldl9hbGxvYyhuKS0+cHRyLCBkZXZfZnJlZShwKSwKICAgIGNvcHlfaDJkKGRzdF9kZXYsIHNyY19ob3N0LCBuKSwgc3luYygpLiBSYWlzZXMgUnVudGltZUVycm9yIG9uIGxvYWQgZmFpbHVyZSAoY2FsbGVyCiAgICBtYXJrcyBWUkFNIGxlZ3MgU0tJUFBFRCkuIiIiCgogICAgZGVmIF9faW5pdF9fKHNlbGYsIGxvZyk6CiAgICAgICAgc2VsZi5vayA9IEZhbHNlCiAgICAgICAgc2VsZi5pbXBsID0gTm9uZQogICAgICAgIHNlbGYubG9nID0gbG9nCiAgICAgICAgbGliID0gc2VsZi5fbG9hZChbImxpYmN1ZGFydC5zby4xMiIsICJsaWJjdWRhcnQuc28uMTMiLCAibGliY3VkYXJ0LnNvIl0KICAgICAgICAgICAgICAgICAgICAgICAgICsgKFtjdHlwZXMudXRpbC5maW5kX2xpYnJhcnkoImN1ZGFydCIpXSBpZiBjdHlwZXMudXRpbC5maW5kX2xpYnJhcnkoImN1ZGFydCIpIGVsc2UgW10pCiAgICAgICAgICAgICAgICAgICAgICAgICArIFsiL3Vzci9sb2NhbC9jdWRhL2xpYjY0L2xpYmN1ZGFydC5zby4xMiIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAiL3Vzci9sb2NhbC9jdWRhL2xpYjY0L2xpYmN1ZGFydC5zbyJdKQogICAgICAgIGlmIGxpYiBpcyBub3QgTm9uZToKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgbGliLmN1ZGFTZXREZXZpY2UucmVzdHlwZSA9IGN0eXBlcy5jX2ludAogICAgICAgICAgICAgICAgbGliLmN1ZGFHZXREZXZpY2VDb3VudC5yZXN0eXBlID0gY3R5cGVzLmNfaW50CiAgICAgICAgICAgICAgICBsaWIuY3VkYUdldERldmljZUNvdW50LmFyZ3R5cGVzID0gW2N0eXBlcy5QT0lOVEVSKGN0eXBlcy5jX2ludCldCiAgICAgICAgICAgICAgICBsaWIuY3VkYUhvc3RBbGxvYy5yZXN0eXBlID0gY3R5cGVzLmNfaW50CiAgICAgICAgICAgICAgICBsaWIuY3VkYUhvc3RBbGxvYy5hcmd0eXBlcyA9IFtjdHlwZXMuUE9JTlRFUihjdHlwZXMuY192b2lkX3ApLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgY3R5cGVzLmNfc2l6ZV90LCBjdHlwZXMuY191aW50XQogICAgICAgICAgICAgICAgbGliLmN1ZGFNYWxsb2MucmVzdHlwZSA9IGN0eXBlcy5jX2ludAogICAgICAgICAgICAgICAgbGliLmN1ZGFNYWxsb2MuYXJndHlwZXMgPSBbY3R5cGVzLlBPSU5URVIoY3R5cGVzLmNfdm9pZF9wKSwgY3R5cGVzLmNfc2l6ZV90XQogICAgICAgICAgICAgICAgbGliLmN1ZGFNZW1jcHkucmVzdHlwZSA9IGN0eXBlcy5jX2ludAogICAgICAgICAgICAgICAgbGliLmN1ZGFNZW1jcHkuYXJndHlwZXMgPSBbY3R5cGVzLmNfdm9pZF9wLCBjdHlwZXMuY192b2lkX3AsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBjdHlwZXMuY19zaXplX3QsIGN0eXBlcy5jX2ludF0KICAgICAgICAgICAgICAgIHJjID0gbGliLmN1ZGFTZXREZXZpY2UoMCkKICAgICAgICAgICAgICAgIGlmIHJjICE9IDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdWRhU2V0RGV2aWNlIHJjPSVzIiAlIHJjKQogICAgICAgICAgICAgICAgbiA9IGN0eXBlcy5jX2ludCgwKQogICAgICAgICAgICAgICAgcmMgPSBsaWIuY3VkYUdldERldmljZUNvdW50KGN0eXBlcy5ieXJlZihuKSkKICAgICAgICAgICAgICAgIGlmIHJjICE9IDAgb3Igbi52YWx1ZSA8IDE6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdWRhR2V0RGV2aWNlQ291bnQgcmM9JXMgbj0lcyIgJSAocmMsIG4udmFsdWUpKQogICAgICAgICAgICAgICAgbG9nKCJjdWRhIGRldmljZXMgdmlzaWJsZTogJWQiICUgbi52YWx1ZSkKICAgICAgICAgICAgICAgIHNlbGYuX3J0ID0gbGliCiAgICAgICAgICAgICAgICBzZWxmLmltcGwgPSAibGliY3VkYXJ0IgogICAgICAgICAgICAgICAgc2VsZi5vayA9IFRydWUKICAgICAgICAgICAgICAgIHJldHVybgogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6ICAjIG5vcWE6IEJMRTAwMQogICAgICAgICAgICAgICAgbG9nKCJjdWRhcnQgbG9hZGVkIGJ1dCBpbml0IGZhaWxlZDogJXMiICUgZSkKICAgICAgICBkcnYgPSBzZWxmLl9sb2FkKFsibGliY3VkYS5zby4xIl0KICAgICAgICAgICAgICAgICAgICAgICAgICsgKFtjdHlwZXMudXRpbC5maW5kX2xpYnJhcnkoImN1ZGEiKV0gaWYgY3R5cGVzLnV0aWwuZmluZF9saWJyYXJ5KCJjdWRhIikgZWxzZSBbXSkpCiAgICAgICAgaWYgZHJ2IGlzIG5vdCBOb25lOgogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICBpZiBkcnYuY3VJbml0KDApICE9IDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdUluaXQhPTAiKQogICAgICAgICAgICAgICAgZGV2ID0gY3R5cGVzLmNfaW50KDApCiAgICAgICAgICAgICAgICBpZiBkcnYuY3VEZXZpY2VHZXQoY3R5cGVzLmJ5cmVmKGRldiksIDApICE9IDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdURldmljZUdldCE9MCIpCiAgICAgICAgICAgICAgICBjdHggPSBjdHlwZXMuY192b2lkX3AoKQogICAgICAgICAgICAgICAgaWYgZHJ2LmN1Q3R4Q3JlYXRlX3YyKGN0eXBlcy5ieXJlZihjdHgpLCAwLCBkZXYpICE9IDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjdUN0eENyZWF0ZSE9MCIpCiAgICAgICAgICAgICAgICBzZWxmLl9kcnYgPSBkcnYKICAgICAgICAgICAgICAgIHNlbGYuaW1wbCA9ICJsaWJjdWRhIgogICAgICAgICAgICAgICAgc2VsZi5vayA9IFRydWUKICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICAgICAgbG9nKCJsaWJjdWRhIHByZXNlbnQgYnV0IGluaXQgZmFpbGVkOiAlcyIgJSBlKQoKICAgIEBzdGF0aWNtZXRob2QKICAgIGRlZiBfbG9hZChjYW5kcyk6CiAgICAgICAgZm9yIGMgaW4gY2FuZHM6CiAgICAgICAgICAgIGlmIG5vdCBjOgogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgcmV0dXJuIGN0eXBlcy5DRExMKGMpCiAgICAgICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICByZXR1cm4gTm9uZQoKICAgIGRlZiBob3N0X2FsbG9jKHNlbGYsIG4pOgogICAgICAgIHAgPSBjdHlwZXMuY192b2lkX3AoKQogICAgICAgIGlmIHNlbGYuaW1wbCA9PSAibGliY3VkYXJ0IjoKICAgICAgICAgICAgcmMgPSBzZWxmLl9ydC5jdWRhSG9zdEFsbG9jKGN0eXBlcy5ieXJlZihwKSwgbiwgMCkKICAgICAgICBlbHNlOgogICAgICAgICAgICByYyA9IHNlbGYuX2Rydi5jdU1lbUFsbG9jSG9zdF92MihjdHlwZXMuYnlyZWYocCksIG4pCiAgICAgICAgaWYgcmMgIT0gMCBvciBub3QgcC52YWx1ZToKICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJob3N0X2FsbG9jIHJjPSVzIHB0cj0lcyAiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAiKHJjPTArTlVMTCBwdHIgb3IgRU5PTUVNID0+IHJhaXNlICd1bGltaXQgLWwnIC8gbG93ZXIgLS1sMC1waW4tZ2liKSIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICUgKHJjLCBwLnZhbHVlKSkKICAgICAgICByZXR1cm4gcAoKICAgIGRlZiBob3N0X2ZyZWUoc2VsZiwgcCk6CiAgICAgICAgdHJ5OgogICAgICAgICAgICAoc2VsZi5fcnQuY3VkYUZyZWVIb3N0IGlmIHNlbGYuaW1wbCA9PSAibGliY3VkYXJ0IgogICAgICAgICAgICAgZWxzZSBzZWxmLl9kcnYuY3VNZW1GcmVlSG9zdCkocCkKICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICBwYXNzCgogICAgZGVmIGRldl9hbGxvYyhzZWxmLCBuKToKICAgICAgICBwID0gY3R5cGVzLmNfdm9pZF9wKCkKICAgICAgICBpZiBzZWxmLmltcGwgPT0gImxpYmN1ZGFydCI6CiAgICAgICAgICAgIHJjID0gc2VsZi5fcnQuY3VkYU1hbGxvYyhjdHlwZXMuYnlyZWYocCksIGN0eXBlcy5jX3NpemVfdChuKSkKICAgICAgICBlbHNlOgogICAgICAgICAgICByYyA9IHNlbGYuX2Rydi5jdU1lbUFsbG9jX3YyKGN0eXBlcy5ieXJlZihwKSwgY3R5cGVzLmNfc2l6ZV90KG4pKQogICAgICAgIGlmIHJjICE9IDAgb3Igbm90IHAudmFsdWU6CiAgICAgICAgICAgIHJhaXNlIFJ1bnRpbWVFcnJvcigiZGV2X2FsbG9jIHJjPSVzIiAlIHJjKQogICAgICAgIHJldHVybiBwCgogICAgZGVmIGRldl9mcmVlKHNlbGYsIHApOgogICAgICAgIHRyeToKICAgICAgICAgICAgKHNlbGYuX3J0LmN1ZGFGcmVlIGlmIHNlbGYuaW1wbCA9PSAibGliY3VkYXJ0IgogICAgICAgICAgICAgZWxzZSBzZWxmLl9kcnYuY3VNZW1GcmVlX3YyKShwKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MKCiAgICBkZWYgY29weV9oMmQoc2VsZiwgZHN0LCBzcmMsIG4pOgogICAgICAgIGlmIHNlbGYuaW1wbCA9PSAibGliY3VkYXJ0IjoKICAgICAgICAgICAgcmMgPSBzZWxmLl9ydC5jdWRhTWVtY3B5KGRzdCwgc3JjLCBjdHlwZXMuY19zaXplX3QobiksIDEpICAjIDEgPSBjdWRhTWVtY3B5SG9zdFRvRGV2aWNlCiAgICAgICAgZWxzZToKICAgICAgICAgICAgcmMgPSBzZWxmLl9kcnYuY3VNZW1jcHlIdG9EX3YyKGRzdCwgc3JjLCBjdHlwZXMuY19zaXplX3QobikpCiAgICAgICAgaWYgcmMgIT0gMDoKICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJjb3B5X2gyZCByYz0lcyIgJSByYykKCiAgICBkZWYgc3luYyhzZWxmKToKICAgICAgICB0cnk6CiAgICAgICAgICAgIChzZWxmLl9ydC5jdWRhRGV2aWNlU3luY2hyb25pemUgaWYgc2VsZi5pbXBsID09ICJsaWJjdWRhcnQiCiAgICAgICAgICAgICBlbHNlIHNlbGYuX2Rydi5jdUN0eFN5bmNocm9uaXplKSgpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgcGFzcwoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBoZWFydGJlYXQgbW9uaXRvcgpjbGFzcyBNb25pdG9yKHRocmVhZGluZy5UaHJlYWQpOgogICAgIiIiQ3VtdWxhdGl2ZSBieXRlcyArIGluc3RhbnRhbmVvdXMgR2lCL3MgZXZlcnkgYGV2ZXJ5YCBzIGZvciB0aGUgRU5USVJFIGxlZyAocnVsZSA8PTE1cykuIiIiCgogICAgZGVmIF9faW5pdF9fKHNlbGYsIHNpbmssIGxlZywgY291bnRlciwgZXZlcnk9NS4wKToKICAgICAgICBzdXBlcigpLl9faW5pdF9fKGRhZW1vbj1UcnVlKQogICAgICAgIHNlbGYuc2luaywgc2VsZi5sZWcsIHNlbGYuYyA9IHNpbmssIGxlZywgY291bnRlcgogICAgICAgIHNlbGYuZXZlcnkgPSBldmVyeQogICAgICAgIHNlbGYuZXYgPSB0aHJlYWRpbmcuRXZlbnQoKQoKICAgIGRlZiBydW4oc2VsZik6CiAgICAgICAgdDAgPSB0aW1lLm1vbm90b25pYygpCiAgICAgICAgbGFzdF9iLCBsYXN0X3QgPSAwLCB0MAogICAgICAgIHdoaWxlIG5vdCBzZWxmLmV2LndhaXQoc2VsZi5ldmVyeSk6CiAgICAgICAgICAgIGIgPSBzZWxmLmNbMF0KICAgICAgICAgICAgbm93ID0gdGltZS5tb25vdG9uaWMoKQogICAgICAgICAgICBpbnN0ID0gKGIgLSBsYXN0X2IpIC8gR2lCIC8gbWF4KG5vdyAtIGxhc3RfdCwgMWUtOSkKICAgICAgICAgICAgc2VsZi5zaW5rLnBvc3QoIlslc10gJTYuMWZzICU5LjJmIEdpQiBjdW0gIGluc3QgJTYuM2YgR2lCL3MiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICUgKHNlbGYubGVnLCBub3cgLSB0MCwgYiAvIEdpQiwgaW5zdCkpCiAgICAgICAgICAgIGxhc3RfYiwgbGFzdF90ID0gYiwgbm93CgogICAgZGVmIHN0b3Aoc2VsZik6CiAgICAgICAgc2VsZi5ldi5zZXQoKQoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBjb2xkIG9wZW4gaGVscGVyCmRlZiBvcGVuX2NvbGQocGF0aCwgc2luayk6CiAgICAiIiJSZXR1cm4gKGZkLCBjb2xkX21ldGhvZCkuIE9fRElSRUNUIGlmIGEgcHJvYmUgcHJlYWQgd29ya3MsIGVsc2UgYnVmZmVyZWQrZmFkdmlzZS4iIiIKICAgIHRyeToKICAgICAgICBmZCA9IG9zLm9wZW4ocGF0aCwgb3MuT19SRE9OTFkgfCBnZXRhdHRyKG9zLCAiT19ESVJFQ1QiLCAwbzQwMDAwKSkKICAgICAgICB0cnk6CiAgICAgICAgICAgIG9zLnByZWFkKGZkLCA0MDk2LCAwKQogICAgICAgICAgICByZXR1cm4gZmQsICJvZGlyZWN0IgogICAgICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgICAgICBvcy5jbG9zZShmZCkKICAgIGV4Y2VwdCBPU0Vycm9yOgogICAgICAgIHBhc3MKICAgIGZkID0gb3Mub3BlbihwYXRoLCBvcy5PX1JET05MWSkKICAgIHJldHVybiBmZCwgImJ1ZmZlcmVkK2ZhZHZpc2UoRE9OVE5FRUQpIgoKCmRlZiBhZHZpc2VfZG9udG5lZWQoZmQsIG9mZiwgbik6CiAgICB0cnk6CiAgICAgICAgb3MucG9zaXhfZmFkdmlzZShmZCwgb2ZmLCBuLCBvcy5QT1NJWF9GQURWX0RPTlRORUVEKQogICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgcGFzcwoKCmRlZiBkcm9wX2NhY2hlcyhzaW5rKToKICAgIHRyeToKICAgICAgICB3aXRoIG9wZW4oIi9wcm9jL3N5cy92bS9kcm9wX2NhY2hlcyIsICJ3IikgYXMgZjoKICAgICAgICAgICAgZi53cml0ZSgiMyIpCiAgICAgICAgc2luay5wb3N0KCJbY29sZF0gZHJvcF9jYWNoZXM9MyB3cml0dGVuIChyb290IGNoYW5uZWwpIikKICAgICAgICByZXR1cm4gImRyb3BfY2FjaGVzIgogICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgcmV0dXJuICJub25lIgoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLSBsZWdzCmRlZiBsZWdfaDJkKGFyZ3MsIHNpbmssIGN1ZGEpOgogICAgIiIiTDA6IHBpbm5lZCBSQU0gLT4gVlJBTSBjZWlsaW5nLiIiIgogICAgbmFtZSA9ICJMMF9oMmRfY2VpbGluZyIKICAgIGlmIGN1ZGEgaXMgTm9uZSBvciBub3QgY3VkYS5vazoKICAgICAgICByZXR1cm4geyJsZWciOiBuYW1lLCAic3RhdHVzIjogIlNLSVBQRUQiLCAicmVhc29uIjogIm5vIGxpYmN1ZGFydC9saWJjdWRhIChzZWUgUFJPQkUpIn0KICAgIHBpbl9naWIgPSBhcmdzLmwwX3Bpbl9naWIKICAgIG5ieXRlcyA9IHBpbl9naWIgKiBHaUIKICAgIHJ1bl9zID0gYXJncy5sMF9zZWNvbmRzCiAgICB0cnk6CiAgICAgICAgaG9zdCA9IGN1ZGEuaG9zdF9hbGxvYyhuYnl0ZXMpCiAgICAgICAgZGV2ID0gY3VkYS5kZXZfYWxsb2MobmJ5dGVzKQogICAgZXhjZXB0IFJ1bnRpbWVFcnJvciBhcyBlOgogICAgICAgIHJldHVybiB7ImxlZyI6IG5hbWUsICJzdGF0dXMiOiAiU0tJUFBFRCIsCiAgICAgICAgICAgICAgICAicmVhc29uIjogImFsbG9jIGZhaWxlZDogJXMiICUgZX0KICAgIGNudCA9IFswXQogICAgc2luay5wb3N0KCJbTDBdIHN0YXJ0OiAlZCBHaUIgcGlubmVkKCVzKSAtPiBWUkFNIGNvcGllcywgbWF4ICVkcyIgJSAocGluX2dpYiwgY3VkYS5pbXBsLCBydW5fcykpCiAgICBtb24gPSBNb25pdG9yKHNpbmssICJMMCIsIGNudCk7IG1vbi5zdGFydCgpCiAgICB0MCA9IHRpbWUubW9ub3RvbmljKCkKICAgIHRyeToKICAgICAgICB3aGlsZSB0aW1lLm1vbm90b25pYygpIC0gdDAgPCBydW5fczoKICAgICAgICAgICAgY3VkYS5jb3B5X2gyZChkZXYsIGhvc3QsIG5ieXRlcykKICAgICAgICAgICAgY250WzBdICs9IG5ieXRlcwogICAgICAgIGN1ZGEuc3luYygpCiAgICBmaW5hbGx5OgogICAgICAgIGVsID0gdGltZS5tb25vdG9uaWMoKSAtIHQwCiAgICAgICAgbW9uLnN0b3AoKQogICAgICAgIGN1ZGEuZGV2X2ZyZWUoZGV2KTsgY3VkYS5ob3N0X2ZyZWUoaG9zdCkKICAgIHJldHVybiB7ImxlZyI6IG5hbWUsICJzdGF0dXMiOiAiT0siLCAiYnl0ZXMiOiBjbnRbMF0sICJzZWMiOiByb3VuZChlbCwgMyksCiAgICAgICAgICAgICJnaWJfcGVyX3MiOiByb3VuZChjbnRbMF0gLyBHaUIgLyBtYXgoZWwsIDFlLTkpLCAzKSwKICAgICAgICAgICAgImltcGwiOiBjdWRhLmltcGwsICJwaW5fZ2liIjogcGluX2dpYiwKICAgICAgICAgICAgInJlZiI6ICJtZWFzdXJlZCBUNCBwYWdlYWJsZSA0LjgyIC8gcGlubmVkIDExLjQwIEdpQi9zIChSRVNVTFRTLm1kOjEwOCkifQoKCmRlZiBfY29weV9zaW5rX2xlZyhhcmdzLCBzaW5rLCBjdWRhLCBudGhyZWFkcywgbmFtZSwgdnJhbSk6CiAgICBwYXRoLCBDSCA9IGFyZ3MuZmlsZSwgYXJncy5jaHVua19taWIgKiAyICoqIDIwCiAgICBpZiBub3Qgb3MucGF0aC5leGlzdHMocGF0aCk6CiAgICAgICAgcmV0dXJuIHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJTS0lQUEVEIiwgInJlYXNvbiI6ICJubyAlcyAocnVuIDAxX0ZJTEwuc2gpIiAlIHBhdGh9CiAgICB0b3RhbCA9IG9zLnBhdGguZ2V0c2l6ZShwYXRoKQogICAgbmNodW5rcyA9ICh0b3RhbCArIENIIC0gMSkgLy8gQ0gKICAgIGNudCA9IFswXQogICAgZXJycyA9IFtdCiAgICBwaW5uZWQgPSB2cmFtIGFuZCBjdWRhIGlzIG5vdCBOb25lIGFuZCBjdWRhLm9rCiAgICBpZiB2cmFtIGFuZCBub3QgcGlubmVkOgogICAgICAgIHJldHVybiB7ImxlZyI6IG5hbWUsICJzdGF0dXMiOiAiU0tJUFBFRCIsICJyZWFzb24iOiAibm8gQ1VEQSBydW50aW1lIChzZWUgUFJPQkUpIn0KICAgICMgYnVmZmVyczogb25lIHBpbm5lZCBzbGFiIChudGhyZWFkcyAqIENIKSArIHBlci10aHJlYWQgZGV2aWNlIHNsaWNlLCBvciBwbGFpbiBieXRlYXJyYXkKICAgIGhvc3Rfc2xhYiA9IGhvc3RfcHRyID0gTm9uZQogICAgZGV2X3B0cnMgPSBbXQogICAgaWYgcGlubmVkOgogICAgICAgIHRyeToKICAgICAgICAgICAgaG9zdF9wdHIgPSBjdWRhLmhvc3RfYWxsb2MobnRocmVhZHMgKiBDSCkKICAgICAgICAgICAgZGV2X3B0cnMgPSBbY3VkYS5kZXZfYWxsb2MoQ0gpIGZvciBfIGluIHJhbmdlKG50aHJlYWRzKV0KICAgICAgICBleGNlcHQgUnVudGltZUVycm9yIGFzIGU6CiAgICAgICAgICAgIGZvciBwIGluIGRldl9wdHJzOgogICAgICAgICAgICAgICAgY3VkYS5kZXZfZnJlZShwKQogICAgICAgICAgICByZXR1cm4geyJsZWciOiBuYW1lLCAic3RhdHVzIjogIlNLSVBQRUQiLCAicmVhc29uIjogImFsbG9jOiAlcyIgJSBlfQogICAgZWxpZiB2cmFtIGlzIEZhbHNlIGFuZCBjdWRhIGlzIG5vdCBOb25lIGFuZCBjdWRhLm9rOgogICAgICAgIHRyeTogICMgaG9zdC1zaW5rIG1vZGUgYnV0IHBpbm5lZCBSQU0gc3RpbGwgcG9zc2libGUKICAgICAgICAgICAgaG9zdF9wdHIgPSBjdWRhLmhvc3RfYWxsb2MobnRocmVhZHMgKiBDSCkKICAgICAgICBleGNlcHQgUnVudGltZUVycm9yOgogICAgICAgICAgICBob3N0X3B0ciA9IE5vbmUKICAgIHBsYWluID0gTm9uZSBpZiBob3N0X3B0ciBlbHNlIGJ5dGVhcnJheShudGhyZWFkcyAqIENIKQogICAgZmQsIGNvbGQgPSBvcGVuX2NvbGQocGF0aCwgc2luaykKICAgIHVzZV9jaGVja3N1bSA9IGFyZ3MuY2hlY2tzdW0KICAgIGlmIHVzZV9jaGVja3N1bToKICAgICAgICB0cnk6CiAgICAgICAgICAgIGltcG9ydCBudW1weSBhcyBucCAgIyBvcHRpb25hbAogICAgICAgIGV4Y2VwdCBJbXBvcnRFcnJvcjoKICAgICAgICAgICAgdXNlX2NoZWNrc3VtID0gRmFsc2UKICAgIG1ldGhvZF9leHRyYSA9ICgicGlubmVkKCVzKSIgJSBjdWRhLmltcGwgaWYgaG9zdF9wdHIgZWxzZSAicGFnZWFibGUiKSBcCiAgICAgICAgKyAoIi9WUkFNIiBpZiB2cmFtIGVsc2UgIi9ob3N0LXNpbmsiKQogICAgc2luay5wb3N0KCJbJXNdIHN0YXJ0OiAlLjFmIEdpQiBmaWxlLCAlZCBzdHJlYW1zIHggJWQgTWlCIGNodW5rcywgJXMsIGNvbGQ9JXMiCiAgICAgICAgICAgICAgJSAobmFtZSwgdG90YWwgLyBHaUIsIG50aHJlYWRzLCBhcmdzLmNodW5rX21pYiwgbWV0aG9kX2V4dHJhLCBjb2xkKSkKCiAgICBkZWYgd29ya2VyKHRpZCk6CiAgICAgICAgY3N1bSA9IDAKICAgICAgICB0cnk6CiAgICAgICAgICAgIGZvciBrIGluIHJhbmdlKHRpZCwgbmNodW5rcywgbnRocmVhZHMpOgogICAgICAgICAgICAgICAgb2ZmID0gayAqIENICiAgICAgICAgICAgICAgICB3YW50ID0gbWluKENILCB0b3RhbCAtIG9mZikKICAgICAgICAgICAgICAgIGRhdGEgPSBvcy5wcmVhZChmZCwgd2FudCwgb2ZmKQogICAgICAgICAgICAgICAgZ290ID0gbGVuKGRhdGEpCiAgICAgICAgICAgICAgICBpZiBnb3QgPT0gMDoKICAgICAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICAgICAgaWYgY29sZCA9PSAiYnVmZmVyZWQrZmFkdmlzZShET05UTkVFRCkiOgogICAgICAgICAgICAgICAgICAgIGFkdmlzZV9kb250bmVlZChmZCwgb2ZmLCBnb3QpCiAgICAgICAgICAgICAgICBpZiB1c2VfY2hlY2tzdW06CiAgICAgICAgICAgICAgICAgICAgY3N1bSArPSBpbnQobnAuZnJvbWJ1ZmZlcihkYXRhLCBkdHlwZT1ucC51aW50OCkuc3VtKGR0eXBlPW5wLmludDY0KSkKICAgICAgICAgICAgICAgIGlmIGhvc3RfcHRyOgogICAgICAgICAgICAgICAgICAgIGN0eXBlcy5tZW1tb3ZlKGN0eXBlcy5jX3ZvaWRfcChob3N0X3B0ci52YWx1ZSArIHRpZCAqIENIKSwgZGF0YSwgZ290KQogICAgICAgICAgICAgICAgICAgIGlmIHZyYW06CiAgICAgICAgICAgICAgICAgICAgICAgIGN1ZGEuY29weV9oMmQoZGV2X3B0cnNbdGlkXSwgY3R5cGVzLmNfdm9pZF9wKGhvc3RfcHRyLnZhbHVlICsgdGlkICogQ0gpLCBnb3QpCiAgICAgICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgICAgIHBsYWluW3RpZCAqIENIOiB0aWQgKiBDSCArIGdvdF0gPSBkYXRhCiAgICAgICAgICAgICAgICBjbnRbMF0gKz0gZ290CiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOiAgIyBub3FhOiBCTEUwMDEgLSBvbmUgc3RyZWFtJ3MgZXJyb3IgbXVzdCBub3Qga2lsbCB0aGUgbGVnCiAgICAgICAgICAgIGVycnMuYXBwZW5kKCJ0JWQ6ICVyIiAlICh0aWQsIGUpKQogICAgICAgIHJldHVybiBjc3VtCgogICAgbW9uID0gTW9uaXRvcihzaW5rLCBuYW1lLCBjbnQpOyBtb24uc3RhcnQoKQogICAgdDAgPSB0aW1lLm1vbm90b25pYygpCiAgICB0aHJlYWRzID0gW3RocmVhZGluZy5UaHJlYWQodGFyZ2V0PXdvcmtlciwgYXJncz0oaSwpKSBmb3IgaSBpbiByYW5nZShudGhyZWFkcyldCiAgICBmb3IgdCBpbiB0aHJlYWRzOgogICAgICAgIHQuc3RhcnQoKQogICAgZm9yIHQgaW4gdGhyZWFkczoKICAgICAgICB0LmpvaW4oKQogICAgaWYgcGlubmVkOgogICAgICAgIGN1ZGEuc3luYygpCiAgICBlbCA9IHRpbWUubW9ub3RvbmljKCkgLSB0MAogICAgbW9uLnN0b3AoKQogICAgb3MuY2xvc2UoZmQpCiAgICBmb3IgcCBpbiBkZXZfcHRyczoKICAgICAgICBjdWRhLmRldl9mcmVlKHApCiAgICBpZiBob3N0X3B0cjoKICAgICAgICBjdWRhLmhvc3RfZnJlZShob3N0X3B0cikKICAgIHJlcyA9IHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJGQUlMRUQiIGlmIGVycnMgZWxzZSAiT0siLAogICAgICAgICAgICJieXRlcyI6IGNudFswXSwgInNlYyI6IHJvdW5kKGVsLCAzKSwKICAgICAgICAgICAiZ2liX3Blcl9zIjogcm91bmQoY250WzBdIC8gR2lCIC8gbWF4KGVsLCAxZS05KSwgMyksCiAgICAgICAgICAgInN0cmVhbXMiOiBudGhyZWFkcywgImNodW5rX21pYiI6IGFyZ3MuY2h1bmtfbWliLAogICAgICAgICAgICJjb2xkX21ldGhvZCI6IGNvbGQsICJwYXRoIjogbWV0aG9kX2V4dHJhLCAiaG9zdCI6IHNpbmsuaG9zdH0KICAgIGlmIGVycnM6CiAgICAgICAgcmVzWyJlcnJvcnMiXSA9IGVycnNbOjRdCiAgICByZXR1cm4gcmVzCgoKZGVmIGxlZ19rdmlraW8oYXJncywgc2luaywgY3VkYSk6CiAgICBuYW1lID0gIkwzX2t2aWtpbyIKICAgIHRyeToKICAgICAgICBpbXBvcnQgY3VweSBhcyBjcAogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOiAgIyBub3FhOiBCTEUwMDEKICAgICAgICByZXR1cm4geyJsZWciOiBuYW1lLCAic3RhdHVzIjogIlNLSVBQRUQiLCAicmVhc29uIjogImN1cHkgbm90IGltcG9ydGFibGUgKCVzKSIgJSB0eXBlKGUpLl9fbmFtZV9ffQogICAgdHJ5OgogICAgICAgIGltcG9ydCBrdmlraW8KICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogICMgbm9xYTogQkxFMDAxCiAgICAgICAgcmV0dXJuIHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJTS0lQUEVEIiwgInJlYXNvbiI6ICJrdmlraW8gbm90IGltcG9ydGFibGUgKCVzKSIgJSB0eXBlKGUpLl9fbmFtZV9ffQogICAgaWYgbm90IG9zLnBhdGguZXhpc3RzKGFyZ3MuZmlsZSk6CiAgICAgICAgcmV0dXJuIHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJTS0lQUEVEIiwgInJlYXNvbiI6ICJubyAlcyIgJSBhcmdzLmZpbGV9CiAgICBDSCA9IGFyZ3MuY2h1bmtfbWliICogMiAqKiAyMAogICAgdG90YWwgPSBvcy5wYXRoLmdldHNpemUoYXJncy5maWxlKQogICAgY250ID0gWzBdCiAgICBzaW5rLnBvc3QoIltMM10gc3RhcnQ6IGt2aWtpbyAlcyAvIGN1cHkgJXMsIHdob2xlIGZpbGUgJS4xZiBHaUIiCiAgICAgICAgICAgICAgJSAoZ2V0YXR0cihrdmlraW8sICJfX3ZlcnNpb25fXyIsICI/IiksIGdldGF0dHIoY3AsICJfX3ZlcnNpb25fXyIsICI/IiksIHRvdGFsIC8gR2lCKSkKCiAgICBkZWYgcnVuX2N1ZmlsZSgpOgogICAgICAgICMgQ3VGaWxlIChHRFMgQVBJOyBvbiBHQ0UgcnVucyBpbiBjb21wYXQgbW9kZSDigJQgdGhhdCBpcyBpdHNlbGYgYSBtZWFzdXJlZCBkYXRhcG9pbnQsCiAgICAgICAgIyBHRFMtdW5hdmFpbGFibGUgdmVyZGljdDogcmVzZWFyY2gvc3RvcmFnZS1pby1nZHMubWQ6OTkpCiAgICAgICAgZiA9IGt2aWtpby5DdUZpbGUoYXJncy5maWxlLCBmbGFncz1vcy5PX1JET05MWSkKICAgICAgICB0cnk6CiAgICAgICAgICAgIGJ1ZiA9IGNwLmVtcHR5KENILCBkdHlwZT1jcC51aW50OCkKICAgICAgICAgICAgb2ZmID0gMAogICAgICAgICAgICB3aGlsZSBvZmYgPCB0b3RhbDoKICAgICAgICAgICAgICAgIG4gPSBmLnJlYWQoYnVmLCBtaW4oQ0gsIHRvdGFsIC0gb2ZmKSwgZmlsZV9vZmZzZXQ9b2ZmKQogICAgICAgICAgICAgICAgb2ZmICs9IGludChuKQogICAgICAgICAgICAgICAgY250WzBdID0gb2ZmCiAgICAgICAgZmluYWxseToKICAgICAgICAgICAgZi5jbG9zZSgpCgogICAgZGVmIHJ1bl9wcmVhZCgpOgogICAgICAgICMga3Zpa2lvIHBvc2l4IGJhdGNoZWQgcHJlYWQgKGRlZXAgcXVldWUpIGludG8gYSBkZXZpY2UgYnVmZmVyIGlmIGV4cG9zZWQKICAgICAgICBpbXBvcnQga3Zpa2lvLnBvc2l4X2lvIGFzIHBpbyAgIyBvbGRlciBBUEkgbGF5b3V0IG1heSBkaWZmZXI7IGd1YXJkZWQgYnkgY2FsbGVyIHRyeQogICAgICAgIHJhaXNlIE5vdEltcGxlbWVudGVkRXJyb3IoIkFQSSBzaGFwZSB2YXJpZXMgYnkga3Zpa2lvIHZlcnNpb247IEN1RmlsZSBsZWcgaXMgdGhlIG1lYXN1cmVkIG9uZSIpCgogICAgbW9uID0gTW9uaXRvcihzaW5rLCAiTDMiLCBjbnQpOyBtb24uc3RhcnQoKQogICAgdDAgPSB0aW1lLm1vbm90b25pYygpCiAgICBlcnIgPSBOb25lCiAgICB0cnk6CiAgICAgICAgcnVuX2N1ZmlsZSgpCiAgICAgICAgY3AuY3VkYS5nZXRfY3VycmVudF9zdHJlYW0oKS5zeW5jaHJvbml6ZSgpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6ICAjIG5vcWE6IEJMRTAwMQogICAgICAgIGVyciA9IHJlcHIoZSkKICAgICAgICB0cnk6CiAgICAgICAgICAgIGNudFswXSA9IDAKICAgICAgICAgICAgcnVuX3ByZWFkKCkKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGUyOiAgIyBub3FhOiBCTEUwMDEKICAgICAgICAgICAgZXJyICs9ICIgfCBwcmVhZDogJXIiICUgZTIKICAgIGVsID0gdGltZS5tb25vdG9uaWMoKSAtIHQwCiAgICBtb24uc3RvcCgpCiAgICBpZiBlcnIgYW5kIGNudFswXSA9PSAwOgogICAgICAgIHJldHVybiB7ImxlZyI6IG5hbWUsICJzdGF0dXMiOiAiU0tJUFBFRCIsICJyZWFzb24iOiAicnVudGltZTogJXMiICUgZXJyfQogICAgcmV0dXJuIHsibGVnIjogbmFtZSwgInN0YXR1cyI6ICJGQUlMRUQiIGlmIGVyciBlbHNlICJPSyIsCiAgICAgICAgICAgICJieXRlcyI6IGNudFswXSwgInNlYyI6IHJvdW5kKGVsLCAzKSwKICAgICAgICAgICAgImdpYl9wZXJfcyI6IHJvdW5kKGNudFswXSAvIEdpQiAvIG1heChlbCwgMWUtOSksIDMpLAogICAgICAgICAgICAiaG9zdCI6IHNpbmsuaG9zdCwgIm5vdGUiOiAiY29tcGF0LW1vZGUgZXhwZWN0ZWQgb24gR0NFIn0KCgojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0gbWFpbgpkZWYgbWFpbigpOgogICAgYXAgPSBhcmdwYXJzZS5Bcmd1bWVudFBhcnNlcihkZXNjcmlwdGlvbj0idDQgc3RyaXBlZC1hcnJheSAtPiBWUkFNIGJlbmNoIChyYXcgR2lCL3MpIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1maWxlIiwgZGVmYXVsdD0iL21udC9yYWlkL2JlbmNoZmlsZSIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tY2h1bmstbWliIiwgdHlwZT1pbnQsIGRlZmF1bHQ9OCwgY2hvaWNlcz0oNCwgOCkpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tc3RyZWFtcyIsIHR5cGU9aW50LCBkZWZhdWx0PTgpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tbGVncyIsIGRlZmF1bHQ9IkwwLEwxLEwyLEwzIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1sMC1waW4tZ2liIiwgdHlwZT1pbnQsIGRlZmF1bHQ9NCkKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1sMC1zZWNvbmRzIiwgdHlwZT1pbnQsIGRlZmF1bHQ9NDUpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tY2hlY2tzdW0iLCBhY3Rpb249InN0b3JlX3RydWUiLAogICAgICAgICAgICAgICAgICAgIGhlbHA9InN1bSBieXRlcyBvZiBmaXJzdCBsZWcgY2h1bmtzIChuZWVkcyBudW1weTsgYXV0by1vZmYgd2l0aG91dCBpdCkiKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLW5vLXNpbmsiLCBhY3Rpb249InN0b3JlX3RydWUiKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXNpbmstcG9ydCIsIHR5cGU9aW50LCBkZWZhdWx0PTE4ODg4KQogICAgYXAuYWRkX2FyZ3VtZW50KCItLW91dCIsIGRlZmF1bHQ9Ii90bXAvYmVuY2hfdDRfcmVzdWx0Lmpzb24iKQogICAgYXJncyA9IGFwLnBhcnNlX2FyZ3MoKQoKICAgIHNpbmsgPSBTaW5rKGVuYWJsZWQ9bm90IGFyZ3Mubm9fc2luaywgcG9ydD1hcmdzLnNpbmtfcG9ydCkKICAgIGxlZ3MgPSBbcy5zdHJpcCgpLnVwcGVyKCkgZm9yIHMgaW4gYXJncy5sZWdzLnNwbGl0KCIsIikgaWYgcy5zdHJpcCgpXQoKICAgIGRlZiBsb2cobSk6CiAgICAgICAgc2luay5wb3N0KCJbaW5pdF0gIiArIG0pCgogICAgbG9nKCJob3N0PSVzIGZpbGU9JXMgc2l6ZT0lLjFmIEdpQiBsZWdzPSVzIGNodW5rPSVkTWlCIHN0cmVhbXM9JWQiCiAgICAgICAgJSAoc2luay5ob3N0LCBhcmdzLmZpbGUsCiAgICAgICAgICAgKG9zLnBhdGguZ2V0c2l6ZShhcmdzLmZpbGUpIC8gR2lCKSBpZiBvcy5wYXRoLmV4aXN0cyhhcmdzLmZpbGUpIGVsc2UgLTEsCiAgICAgICAgICAgIiwiLmpvaW4obGVncyksIGFyZ3MuY2h1bmtfbWliLCBhcmdzLnN0cmVhbXMpKQogICAgbG9nKCJweXRob249JXMiICUgc3lzLnZlcnNpb24uc3BsaXQoKVswXSkKCiAgICBjdWRhID0gQ3VkYShsb2cpCiAgICBsb2coImN1ZGE6ICVzIiAlIChjdWRhLmltcGwgaWYgY3VkYS5vayBlbHNlCiAgICAgICAgICAgICAgICAgICAgICAiTk9ORSAobGliY3VkYXJ0L2xpYmN1ZGEgbm90IGxvYWRhYmxlIC0+IFZSQU0gbGVncyBTS0lQUEVELCBMMS9MMiBsYW5kIGluIGhvc3QgUkFNKSIpKQoKICAgIHJlc3VsdHMgPSBbXQoKICAgIGRlZiBydW4obGVnX2lkLCBmbik6CiAgICAgICAgZHJvcCA9IGRyb3BfY2FjaGVzKHNpbmspCiAgICAgICAgdCA9IGZuKCkKICAgICAgICB0LnNldGRlZmF1bHQoImNvbGRfcHJlcCIsIGRyb3ApCiAgICAgICAgdFsiaG9zdCJdID0gdC5nZXQoImhvc3QiLCBzaW5rLmhvc3QpCiAgICAgICAgcmVzdWx0cy5hcHBlbmQodCkKICAgICAgICBzaW5rLnBvc3QoIlJFU1VMVF9KU09OICIgKyBqc29uLmR1bXBzKHQsIHNvcnRfa2V5cz1UcnVlKSkKCiAgICBpZiAiTDAiIGluIGxlZ3M6CiAgICAgICAgcnVuKCJMMCIsIGxhbWJkYTogbGVnX2gyZChhcmdzLCBzaW5rLCBjdWRhKSkKICAgIGlmICJMMSIgaW4gbGVnczoKICAgICAgICBydW4oIkwxIiwgbGFtYmRhOiBfY29weV9zaW5rX2xlZyhhcmdzLCBzaW5rLCBjdWRhLCAxLCAiTDFfY29sZF8xc3RyZWFtIiwgdnJhbT1jdWRhLm9rKSkKICAgIGlmICJMMiIgaW4gbGVnczoKICAgICAgICBydW4oIkwyIiwgbGFtYmRhOiBfY29weV9zaW5rX2xlZyhhcmdzLCBzaW5rLCBjdWRhLCBhcmdzLnN0cmVhbXMsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIkwyXyVkc3RyZWFtcyIgJSBhcmdzLnN0cmVhbXMsIHZyYW09Y3VkYS5vaykpCiAgICBpZiAiTDMiIGluIGxlZ3M6CiAgICAgICAgcnVuKCJMMyIsIGxhbWJkYTogbGVnX2t2aWtpbyhhcmdzLCBzaW5rLCBjdWRhKSkKCiAgICBzaW5rLnBvc3QoIlJFU1VMVF9KU09OX0FMTCAiICsganNvbi5kdW1wcyhyZXN1bHRzLCBzb3J0X2tleXM9VHJ1ZSkpCiAgICB0cnk6CiAgICAgICAgd2l0aCBvcGVuKGFyZ3Mub3V0LCAidyIpIGFzIGY6CiAgICAgICAgICAgIGpzb24uZHVtcCh7Imhvc3QiOiBzaW5rLmhvc3QsICJyZXN1bHRzIjogcmVzdWx0c30sIGYsIGluZGVudD0xKQogICAgZXhjZXB0IE9TRXJyb3IgYXMgZToKICAgICAgICBzaW5rLnBvc3QoIltvdXRdIGNvdWxkIG5vdCB3cml0ZSAlczogJXIiICUgKGFyZ3Mub3V0LCBlKSkKICAgIHNpbmsucG9zdCgiVDRCRU5DSF9ET05FICVzIiAlIHNpbmsuaG9zdCkKICAgIGJhZCA9IFtyIGZvciByIGluIHJlc3VsdHMgaWYgci5nZXQoInN0YXR1cyIpID09ICJGQUlMRUQiXQogICAgc3lzLmV4aXQoMSBpZiBiYWQgZWxzZSAwKQoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICBtYWluKCkK").decode()\nFR = base64.b64decode("IyEvYmluL2Jhc2gKUz0kezE6LXh9CmV4cG9ydCBUNF9TPSRTCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCmV4cG9ydCBMRF9MSUJSQVJZX1BBVEg9L3Vzci9sb2NhbC9jdWRhL2xpYjY0Oi91c3IvbGliL3g4Nl82NC1saW51eC1nbnU6JExEX0xJQlJBUllfUEFUSApIPSQoaG9zdG5hbWUpOyBNR1I9IiR7SCUlLXctKn0tbS4kKGhvc3RuYW1lIC1kKSIKcG9zdCgpIHsgY3VybCAtbTUgLXMgLVggUE9TVCAtLWRhdGEtYmluYXJ5ICIkMSIgImh0dHA6Ly8kTUdSOjE4ODg4L2ZydDRiLSRIIiB8fCB0cnVlOyB9CnVsaW1pdCAtbCB1bmxpbWl0ZWQgMj4vZGV2L251bGwgfHwgdHJ1ZSAgICMgcGlubmVkIGN1ZGFIb3N0QWxsb2MgbmVlZHMgbWVtbG9jayAoZm91bmQgaW4gc21va2UgdGVzdCkKZXhlYyA5Pi90bXAvdDRiLiRTLmxvY2s7IGZsb2NrIC1uIDkgfHwgeyBwb3N0ICJUNEJfU0tJUExPQ0sgJEggZHVwLXRhc2stZXhpdHMiOyBleGl0IDA7IH0KcG9zdCAiVDRCX0xBVU5DSEVEICRIIFM9JFMiCnB5dGhvbjMgL3RtcC9iZW5jaF90NC5weSAtLWxlZ3MgTDAsTDEsTDIsTDMgLS1jaHVuay1taWIgOCAtLXN0cmVhbXMgOCA+PiAvdG1wL3Q0Yi5vdXQgMj4mMQpwb3N0ICJUNEJfRVhJVCAkSCByYz0kPyB0YWlsOiAkKHRhaWwgLWMgMzAwIC90bXAvdDRiLm91dCkiCg==").decode()\nMGRFQ = "localhost"\ndef __t4_launch():\n    h = socket.gethostname().split(".")[0]\n    open("/tmp/bench_t4.py", "w").write(PAY)\n    open("/tmp/t4b-fr.sh", "w").write(FR)\n    # RESOLVE bash, don\'t assume it: executors ARE host processes, so shutil.which("bash") here\n    # returns the host\'s own bash -> the exact file visible at /host<that path> once / is mounted.\n    # Bounded find (depth 4, first hit) only if PATH lookup fails; ultimate default Debian\'s /bin/bash.\n    import shutil\n    _b = shutil.which("bash") or subprocess.run(\n        "find / -maxdepth 4 \\( -path /proc -o -path /sys -o -path /var/lib/docker \\) -prune "\n        "-o -name bash -type f -print 2>/dev/null | head -1",\n        shell=True, capture_output=True, text=True).stdout.strip() or "/bin/bash"\n    HB = "/host" + _b\n    subprocess.run("docker image inspect emptyimg >/dev/null 2>&1"\n                   " || tar -c --files-from /dev/null | docker import - emptyimg",\n                   shell=True, capture_output=True, timeout=60)\n    r = subprocess.run("docker run -d --name t4b-" + SFX + "-" + h +\n                       " --privileged --pid=host --uts=host --network=host --ipc=host "\n                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp emptyimg "\n                       + HB + " -c \'/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/t4b-fr.sh " + SFX + "\'",\n                       shell=True, capture_output=True, text=True)\n    return "LAUNCHOK " + h + " bash=" + HB + " rc=" + str(r.returncode) + " " + (r.stderr or "")[-60:]\n\nif __name__ == "__main__":\n    SFX = os.environ.get("SFX", "x")\n    from pyspark.sql import SparkSession\n    sp = SparkSession.builder.appName("t4b").getOrCreate()\n    for x in sorted(set(sp.sparkContext.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):\n        print("WL:", x, flush=True)\n    sp.stop()\n'
+        open("/tmp/job_t4b.py", "w").write(JOB)
+        p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
+            "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
+            "/tmp/job_t4b.py"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            env=dict(os.environ, SFX=SFX))
+        for line in p.stdout:
+            l = line.rstrip()
+            if l.startswith("WL:"):
+                print(l[:250], flush=True)
+        print("spark-submit rc:", p.wait(), flush=True)
+    print(">>> SINK cell: expect T4BENCH_DONE from BOTH workers <<<", flush=True)
+```
+
+## C8 — fetch results  [cell_fetch.txt]
+```python
+# === io_t4 fetch cell (C8): pull worker logs + bench JSON back into the notebook (B5 pattern) ===
+# Keep as spark-submit: pure read, no docker/hostimg involved; runs even if the session died.
 import subprocess
 JOB = '''
 import socket, subprocess, os
-def probe():
-    h = os.uname().nodename
-    ls = "; ".join(subprocess.run("lsblk -d -o NAME,TRAN,MODEL,SIZE | grep 375G", shell=True, capture_output=True, text=True).stdout.splitlines())
-    nv = subprocess.run("ls /dev/nvme*n1 2>/dev/null || echo no-nvme-disks", shell=True, capture_output=True, text=True).stdout.strip()
-    mt = subprocess.run('curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/machine-type', shell=True, capture_output=True, text=True).stdout
-    return "IFACE " + h + " | " + mt.split("/")[-1].strip() + " | 375G-devs: " + ls + " | " + nv
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("iface").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(8), 8).map(lambda _: probe()).collect())):
-        print(x, flush=True)
-    sp.stop()
-'''
-open("/tmp/job_iface.py", "w").write(JOB)
-p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
-   "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_iface.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-log = []
-for line in p.stdout:
-    log.append(line)
-    if line.startswith("IFACE"): print(line.rstrip()[:250], flush=True)
-rc = p.wait()
-print("rc:", rc, flush=True)
-if rc != 0:
-    print("--- job FAILED - last 25 lines of its output ---")
-    print("".join(log[-25:]))
-```
-
-## Step 0 (run once per new cluster): `envprobe`
-
-Verifies on every worker, in 1-2 minutes, everything the privileged steps assume: OS, docker server, that `hostimg` can be built, and the full escape end-to-end. Green line = `uid=0(root)` twice, `INIMAGE_OK`, `NSENTER_OK`, disk count, `active`. If this passes, every step below works on this machine - no guessing.
-
-```python
-import subprocess, threading, time
-JOB = '''
-import os, socket, subprocess
 def sh(c):
-    r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=300)
-    return c + " ==> " + ((r.stdout or "") + (r.stderr or "")).strip().replace(chr(10), " ~ ")[:300]
-def probe():
-    p = ["ENVPROBE " + socket.gethostname().split(".")[0]]
-    p.append(sh("uname -m"))
-    p.append(sh("head -2 /etc/os-release"))
-    p.append("bash=" + str(os.path.exists("/bin/bash")) +
-             " ld=" + str(os.path.exists("/lib64/ld-linux-x86-64.so.2")) +
-             " libc=" + str(os.path.exists("/lib/x86_64-linux-gnu/libc.so.6")))
-    p.append(sh("docker info --format server-{{.ServerVersion}}-driver-{{.Driver}}"))
-    p.append(sh("docker images --format {{.Repository}}:{{.Tag}}-{{.Size}} | head -8"))
-    p.append(sh("docker image inspect hostimg --format IMGCACHED || "
-                "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg"))
-    esc = ("#!/bin/bash" + chr(10) + "id" + chr(10) + "echo INIMAGE_OK" + chr(10) +
-           "/usr/bin/nsenter -t 1 -m -- /bin/bash -c " + chr(34) +
-           "id; echo NSENTER_OK; ls -d /sys/block/sd* 2>/dev/null | wc -l; " +
-           "systemctl is-active hadoop-yarn-nodemanager; df -h /mnt 2>/dev/null | tail -1" + chr(34) + chr(10))
-    open("/tmp/envprobe_esc.sh", "w").write(esc)
-    p.append(sh("docker run --rm --privileged --pid=host --uts=host --network=host "
-                "--ipc=host -v /:/host -v /tmp:/tmp hostimg /bin/bash /tmp/envprobe_esc.sh"))
-    return " ;; ".join(p)
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("envprobe").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(4), 4).map(lambda _: probe()).collect())):
-        print(x, flush=True)
-    sp.stop()
-'''
-open("/tmp/job_envprobe.py", "w").write(JOB)
-p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
-   "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
-   "/tmp/job_envprobe.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
-for line in p.stdout:
-    log.append(line)
-    if line.startswith("ENVPROBE"): print(line.rstrip(), flush=True)
-done[0] = True
-rc = p.wait()
-print("rc:", rc, flush=True)
-if rc != 0:
-    print("".join(log[-25:]))
-```
-
-## Step 7 - Glue the disks together (RAID0 stripe)
-
-What this cell does on each worker (through the worker's own Docker, as root):
-1. stops the Hadoop/Yarn services that hold the disks,
-2. finds every 375-GiB disk by SIZE (so the boot disk can never be touched),
-3. glues all 16 into one device with `dmsetup` (stripe = classic RAID0),
-4. makes one big ext4 filesystem, mounts it at `/mnt/raid` (~5.9 TiB),
-5. fixes the Hadoop folder owners and restarts the services.
-
-It runs once; running it again says ALREADY and does nothing. Expect
-`LAUNCH_RESULT ... rc=0` for both workers, then look at step 8.
-
-```python
-import subprocess, threading, time
-STRIP = r"""#!/bin/bash
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-exec >> /tmp/strip.log 2>&1
-set -x
-shopt -s nullglob
-H=$(hostname); MGR="${H%%-w-*}-m.$(hostname -d)"
-post() { curl -m5 -s -X POST --data-binary @/tmp/strip.log "http://$MGR:18888/$H" || true; }
-date; echo "STRIP START $H"; post
-exec 9>/tmp/strip.lock; flock -n 9 || { echo ALREADY_RUNNING; exit 0; }
-LDIRS=$(cut -f2 -d' ' /proc/mounts | grep "^/mnt/" | tr '\n' ' ')
-echo "LDIRS=$LDIRS"; post
-DISKS=""
-for b in /sys/block/sd* /sys/block/nvme*n1; do S=$(cat $b/size 2>/dev/null); if [ -n "$S" ] && [ "$S" -gt 700000000 ]; then DISKS="$DISKS /dev/$(basename $b)"; fi; done
-N=$(echo $DISKS | wc -w); echo "DISKS=$DISKS N=$N"
-[ "$N" -lt 16 ] && { echo WANT_16_GOT_$N; post; exit 1; }
-SZ=$(for d in $DISKS; do cat /sys/block/$(basename $d)/size; done | sort -n | head -1)
-LEN=$((SZ*N)); echo "SZ=$SZ LEN=$LEN"; post
-systemctl stop hadoop-yarn-nodemanager hadoop-hdfs-datanode 2>&1; sleep 3
-for m in $LDIRS; do umount -l $m; done
-sleep 2
-ARGS=""; for d in $DISKS; do ARGS="$ARGS $d 0"; done
-OK=""
-for T in striped stripe; do
-  dmsetup create ssdraid --table "0 $LEN $T $N 256 $ARGS" && { echo DM_OK=$T; OK=1; break; }
-  dmsetup remove ssdraid 2>/dev/null
-done
-post
-if [ -n "$OK" ] && dmsetup info ssdraid >/dev/null 2>&1; then
-  echo MKFS_BEGIN; post
-  mkfs.ext4 -F -q /dev/mapper/ssdraid && mkdir -p /mnt/raid && mount /dev/mapper/ssdraid /mnt/raid && chmod 1777 /mnt/raid && echo ALLDONE_6T
-  df -h /mnt/raid
-else
-  echo DM_FAIL
-fi
-for m in $LDIRS; do
-  mkdir -p $m/hadoop/dfs/data $m/hadoop/yarn/nm-local-dir
-  chown -R hdfs:hadoop $m/hadoop/dfs
-  chown -R yarn:yarn $m/hadoop/yarn
-  chown root:root $m; chmod 0755 $m
-done
-echo DIRS_FIXED; post
-systemctl restart hadoop-hdfs-datanode 2>&1 || true
-systemctl restart hadoop-yarn-nodemanager 2>&1 || true
-sleep 15
-echo "DN=$(systemctl is-active hadoop-hdfs-datanode 2>&1) NM=$(systemctl is-active hadoop-yarn-nodemanager 2>&1)"
-echo STRIP_DONE; date; post
-"""
-JOB = '''
-import socket, subprocess, urllib.request, time
-STRIP = open("strip-host.sh").read()
-def mgr():
-    fq = socket.getfqdn()
-    return socket.gethostname().split("-w-")[0] + "-m." + ".".join(fq.split(".")[1:])
-def post(h, msg):
-    try:
-        urllib.request.urlopen("http://" + mgr() + ":18888/step-" + h,
-                               (msg + chr(10)).encode(), timeout=5)
-    except Exception:
-        pass
-def launch():
-    h = socket.gethostname(); name = "strip-" + h.split(".")[0]
-    post(h, "GUARD checking container " + name)
-    st = subprocess.run("docker inspect -f '{{.State.Running}}' " + name + " 2>/dev/null || echo none",
-                        shell=True, capture_output=True, text=True).stdout.strip()
-    if st == "True":
-        post(h, "GUARD already running -> skip"); return (h, "ALREADY_RUNNING")
-    if st != "none":
-        post(h, "GUARD removing dead container"); subprocess.run("docker rm -f " + name + " 2>/dev/null; true", shell=True, capture_output=True)
-    open("/tmp/strip-host.sh", "w").write(STRIP)
-    t0 = time.time()
-    r = subprocess.run("docker image inspect hostimg >/dev/null 2>&1 && echo CACHED || echo MISSING",
-                       shell=True, capture_output=True, text=True).stdout.strip()
-    if r != "CACHED":
-        post(h, "HOSTIMG missing: tar of /bin /lib /lib64 /usr started")
-        t1 = time.time()
-        r2 = subprocess.run("tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
-                            shell=True, capture_output=True, text=True, timeout=900)
-        post(h, "HOSTIMG import done in %ds rc=%s out=%s" % (time.time()-t1, r2.returncode, (r2.stdout or r2.stderr)[-80:]))
-    else:
-        post(h, "HOSTIMG cached")
-    r = subprocess.run("docker run -d --name " + name + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /tmp:/tmp hostimg "
-                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/strip-host.sh'",
-                       shell=True, capture_output=True, text=True)
-    post(h, "DOCKER_RUN rc=%s out=%s err=%s" % (r.returncode, (r.stdout or "")[-30:], (r.stderr or "")[-120:]))
-    post(h, "TOTAL launch %ds" % (time.time()-t0))
-    return (h, "rc=%s %s" % (r.returncode, (r.stderr or r.stdout)[-80:]))
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("strip-launch").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(2), 2).map(lambda _: launch()).collect())):
-        print("LAUNCH_RESULT:", x, flush=True)
-    sp.stop()
-'''
-open("/tmp/strip-host.sh", "w").write(STRIP)
-open("/tmp/job_strip.py", "w").write(JOB)
-cmd = ["spark-submit", "--master", "yarn", "--deploy-mode", "client",
-       "--conf", "spark.executor.instances=2",
-       "--conf", "spark.excludeOnFailure.enabled=false",
-       "--conf", "spark.yarn.executor.launch.excludeOnFailure.enabled=false",
-       "--conf", "spark.executor.maxNumFailures=1000",
-       "--files", "/tmp/strip-host.sh",
-       "--conf", "spark.executor.memory=1g", "/tmp/job_strip.py"]
-p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
-for line in p.stdout:
-    log.append(line)
-    if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
-done[0] = True
-print("rc:", p.wait(), flush=True)
-```
-
-## Step 8 - Check that the stripe is healthy
-
-```python
-import subprocess, threading, time
-JOB = '''
-import socket, subprocess, os
+    r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=30)
+    return ((r.stdout or "") + (r.stderr or ""))[-2500:]
 def probe():
     h = socket.gethostname().split(".")[0]
-    def sh(c):
-        r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=30)
-        return ((r.stdout or "") + (r.stderr or ""))[-1200:]
-    log = open("/tmp/strip.log").read()[-1800:] if os.path.exists("/tmp/strip.log") else "MISSING strip.log (script never ran)"
-    docker = sh("docker ps -a --format '{{.Names}} {{.Status}}' | grep strip || echo no-strip-container")
-    df = sh("df -h /mnt/raid | tail -1")
-    return "\\n##### " + h + " #####\\n" + log + "\\nDOCKER: " + docker + "\\nDF: " + df
+    parts = []
+    for f in ["/tmp/prep-t4.log", "/tmp/t4probe.log", "/tmp/fill-t4.log", "/tmp/t4audit.out",
+              "/tmp/t4s.out", "/tmp/t4f.out", "/tmp/t4b.out", "/tmp/t4p.out", "/tmp/t4d.out"]:
+        if os.path.exists(f):
+            parts.append("----- " + f + " -----\\n" + sh("tail -c 2400 " + f))
+    for f in ["/tmp/bench_t4_result.json"]:
+        if os.path.exists(f):
+            parts.append("----- JSON " + f + " -----\\n" + sh("cat " + f))
+    parts.append("DF: " + sh("df -h /mnt/raid | tail -1"))
+    return "\\n##### " + h + " #####" + "".join(parts)
 if __name__ == "__main__":
     from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("fetch").getOrCreate()
-    out = sp.sparkContext.parallelize(range(16), 16).map(lambda _: probe()).collect()
-    for x in sorted(set(out)): print(x, flush=True)
+    sp = SparkSession.builder.appName("t4fetch").getOrCreate()
+    for x in sorted(set(sp.sparkContext.parallelize(range(16), 16).map(lambda _: probe()).collect())):
+        print(x, flush=True)
     sp.stop()
 '''
-open("/tmp/job_fetch.py", "w").write(JOB)
+open("/tmp/job_t4fetch.py", "w").write(JOB)
 p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
                       "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
-                      "/tmp/job_fetch.py"],
+                      "/tmp/job_t4fetch.py"],
                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
 for line in p.stdout:
-    if line[:3] != "26/" and not line.startswith("\tat "): print(line.rstrip()[:300], flush=True)
-done[0] = True
+    if line[:3] != "26/" and not line.startswith("\tat "):
+        print(line.rstrip()[:400], flush=True)
 print("rc:", p.wait(), flush=True)
 ```
 
-```python
-import subprocess, json
-r = subprocess.run(["sudo","curl","-s","-m10","http://localhost:8088/ws/v1/cluster/nodes"], capture_output=True, text=True, timeout=30)
-for x in json.loads(r.stdout)["nodes"]["node"]:
-    print("NODE:", x["nodeHostName"].split(".")[0], "|", x["state"], "|", x["healthReport"][:100] or "OK")
+
+## Out-of-sequence extras (forensics, not part of C0→C8)
+- `paste/cell_diag1_master.txt` — master-side: is :18888 really bound? (run in the SINK kernel)
+- `paste/cell_diag2_worker.txt` — worker-side: what happened to the POSTs? (regenerated v3, hostimg)
+
+## Regenerating this file + all cells (login node)
 ```
-
-## Step 9 - Write test: 40 GiB per worker
-
-Writes 40 GiB of zeros straight to the disks (bypassing the Linux page cache, so the
-number is real disk speed, not RAM). Progress lines go to the step-4 cell.
-Watch for `W_DONE <worker> <seconds> <GiB/s>`. With 16 disks expect ~3 GiB/s.
-
-```python
-import subprocess, random
-FR = r"""#!/bin/bash
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-H=$(hostname); MGR="${H%%-w-*}-m.$(hostname -d)"
-post() { curl -m5 -s -X POST --data-binary "$1" "http://$MGR:18888/w-$H" || true; }
-exec 9>/tmp/w.lock; flock -n 9 || { post "W_SKIPLOCK $H"; exit 0; }
-F=/mnt/raid/benchfile; T=$((40*1024*1024*1024))
-if [ "$(stat -c %s "$F" 2>/dev/null || echo 0)" = "$T" ]; then post "W_ALREADY $H"; exit 0; fi
-rm -f "$F"; post "W_START $H"; t0=$(date +%s)
-dd if=/dev/zero of="$F" bs=4M count=10240 oflag=direct status=noxfer 2>/tmp/w.err & pid=$!
-while kill -0 $pid 2>/dev/null; do sleep 10
-  wb=$(awk '/^write_bytes/{print $2}' /proc/$pid/io 2>/dev/null); e=$(( $(date +%s)-t0 ))
-  [ -n "$wb" ] && post "W $H ${e}s $(awk "BEGIN{printf \"%.2f\", $wb/1073741824}") GiB ~$(awk "BEGIN{printf \"%.2f\", $wb/1073741824/(($e)+1)}") GiB/s"
-done; wait $pid; e=$(( $(date +%s)-t0 ))
-post "W_DONE $H ${e}s $(awk "BEGIN{printf \"%.2f\", 40/$e}") GiB/s"
-"""
-JOB = '''
-import socket, subprocess
-FR = open("/tmp/w.sh").read()
-def launch():
-    h = socket.gethostname().split(".")[0]
-    open("/tmp/w.sh", "w").write(FR)
-    r = subprocess.run("docker run -d --name w-" + SUFFIX + "-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp hostimg "
-                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/w.sh'",
-                       shell=True, capture_output=True, text=True)
-    return "WOK " + h + " rc=" + str(r.returncode)
-if __name__ == "__main__":
-    import os
-    SUFFIX = os.environ["SFX"]
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("w-launch").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(16), 16).map(lambda _: launch()).collect())):
-        print("WLAUNCH:", x, flush=True)
-    sp.stop()
-'''
-open("/tmp/w.sh", "w").write(FR); open("/tmp/job_w.py", "w").write(JOB)
-import os
-env = dict(os.environ, SFX="%04x" % random.randrange(65536))
-p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
-   "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_w.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
-for line in p.stdout:
-    if line.startswith("WLAUNCH:"): print(line.rstrip()[:120], flush=True)
-done[0] = True
-p.wait(); print("watch LISTENER cell for W_DONE x2", flush=True)
+cd .../workbench-cli/bench/io_t4
+python3 make_paste_cell.py 00_RESET.sh               > paste/cell_3_reset.txt
+python3 make_paste_cell.py 03_PROBE_GPU.sh           > paste/cell_probe.txt
+python3 make_paste_cell.py 00_ROOT_SETUP.sh          > paste/cell_setup.txt
+python3 make_paste_cell.py 01_FILL.sh                > paste/cell_fill.txt
+python3 make_paste_cell.py 02_bench_storage_to_gpu.py > paste/cell_bench.txt
+python3 make_paste_cell.py 04_DIAG.sh                > paste/cell_diag2_worker.txt
+python3 make_paste_cell.py --fetch                   > paste/cell_fetch.txt
+python3 make_reproduce.py    # rebuilds this file from paste/ verbatim
+python3 harness_check.py     # the banning-harness seed: compile + scan + CPU smoke, one command
 ```
-
-## Step 10 - Read tests
-
-**10a. Same file, 3 times in a row.** Reads the 40 GiB back three times with 4 MiB
-requests. This separates a short speed "burst" from the real steady speed. Look for
-`R_ALLDONE <worker> total <s>s passes: a b c`. Expect ~3.4 GiB/s, same on all passes.
-
-```python
-import subprocess, random
-FR = r"""#!/bin/bash
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-H=$(hostname); MGR="${H%%-w-*}-m.$(hostname -d)"
-post() { curl -m5 -s -X POST --data-binary "$1" "http://$MGR:18888/r-$H" || true; }
-exec 9>/tmp/r.lock; flock -n 9 || { post "R_SKIPLOCK $H"; exit 0; }
-F=/mnt/raid/benchfile
-if [ "$(stat -c %s "$F" 2>/dev/null || echo 0)" != "$((40*1024*1024*1024))" ]; then post "R_NOFILE $H"; exit 0; fi
-SUM=0; ALL=""
-for p in 1 2 3; do
-  post "R_P${p}_START $H"; t0=$(date +%s)
-  dd if="$F" of=/dev/null bs=4M count=10240 iflag=direct status=noxfer 2>/tmp/r.err & pid=$!
-  ( while sleep 5; do kill -0 $pid 2>/dev/null || break
-      rb=$(awk '/^read_bytes/{print $2}' /proc/$pid/io 2>/dev/null); e=$(( $(date +%s)-t0 ))
-      [ -n "$rb" ] && post "R_P${p} $H ${e}s $(awk "BEGIN{printf \"%.2f\", $rb/1073741824}") GiB ~$(awk "BEGIN{printf \"%.2f\", $rb/1073741824/(($e)+1)}") GiB/s"
-    done ) & mon=$!
-  wait $pid; kill $mon 2>/dev/null; e=$(( $(date +%s)-t0 )); r=$(awk "BEGIN{printf \"%.2f\", 40/($e)}")
-  post "R_P${p}DONE $H ${e}s ${r} GiB/s"; SUM=$((SUM+e)); ALL="$ALL ${r}"
-done
-post "R_ALLDONE $H total ${SUM}s passes:$ALL"
-"""
-JOB = '''
-import socket, subprocess
-FR = open("/tmp/r.sh").read()
-def launch():
-    h = socket.gethostname().split(".")[0]
-    open("/tmp/r.sh", "w").write(FR)
-    r = subprocess.run("docker run -d --name r-" + SUFFIX + "-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp hostimg "
-                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/r.sh'",
-                       shell=True, capture_output=True, text=True)
-    return "ROK " + h + " rc=" + str(r.returncode)
-if __name__ == "__main__":
-    import os
-    SUFFIX = os.environ["SFX"]
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("r-launch").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(16), 16).map(lambda _: launch()).collect())):
-        print("RLAUNCH:", x, flush=True)
-    sp.stop()
-'''
-open("/tmp/r.sh", "w").write(FR); open("/tmp/job_r.py", "w").write(JOB)
-import os
-env = dict(os.environ, SFX="%04x" % random.randrange(65536))
-p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
-   "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_r.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
-for line in p.stdout:
-    if line.startswith("RLAUNCH:"): print(line.rstrip()[:120], flush=True)
-done[0] = True
-p.wait(); print("watch LISTENER cell for R_ALLDONE x2", flush=True)
-```
-
-**10b. 8 readers at once (deep queue).** One reader waits for every request to finish
-before the next one, which leaves the 16 disks mostly idle. Eight readers keep ~128
-requests in flight, which is what Google's speed table assumes. This is also the shape
-that kvikio (storage->GPU streaming) uses. Expect ~6 GiB/s - the official 16-disk SCSI
-maximum. If you see this number, your GPU reader can realistically eat 6 GiB/s per node.
-
-```python
-import subprocess, random
-FR = r"""#!/bin/bash
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-H=$(hostname); MGR="${H%%-w-*}-m.$(hostname -d)"
-post() { curl -m5 -s -X POST --data-binary "$1" "http://$MGR:18888/r2-$H" || true; }
-exec 9>/tmp/r2.lock; flock -n 9 || { post "R2_SKIPLOCK $H"; exit 0; }
-F=/mnt/raid/benchfile
-if [ "$(stat -c %s "$F" 2>/dev/null || echo 0)" != "$((40*1024*1024*1024))" ]; then post "R2_NOFILE $H"; exit 0; fi
-post "R2_START $H 8 streams bs=4M"; t0=$(date +%s)
-PIDS=""
-for i in 0 1 2 3 4 5 6 7; do
-  dd if="$F" of=/dev/null bs=4M count=1280 skip=$((i*1280)) iflag=direct status=noxfer 2>/dev/null &
-  PIDS="$PIDS $!"
-done
-( while sleep 5; do
-      TOT=0
-      for pid in $PIDS; do
-        rb=$(awk '/^read_bytes/{print $2}' /proc/$pid/io 2>/dev/null); TOT=$((TOT + ${rb:-0}))
-      done
-      e=$(( $(date +%s)-t0 ))
-      post "R2 $H ${e}s $(awk "BEGIN{printf \"%.2f\", $TOT/1073741824}") GiB ~$(awk "BEGIN{printf \"%.2f\", $TOT/1073741824/(($e)+1)}") GiB/s"
-    done ) & mon=$!
-for pid in $PIDS; do wait $pid; done
-kill $mon 2>/dev/null; e=$(( $(date +%s)-t0 ))
-post "R2_DONE $H ${e}s $(awk "BEGIN{printf \"%.2f\", 40/($e)}") GiB/s aggregate-8-streams"
-"""
-JOB = '''
-import socket, subprocess
-FR = open("/tmp/r2.sh").read()
-def launch():
-    h = socket.gethostname().split(".")[0]
-    open("/tmp/r2.sh", "w").write(FR)
-    r = subprocess.run("docker run -d --name r2-" + SUFFIX + "-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp hostimg "
-                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/r2.sh'",
-                       shell=True, capture_output=True, text=True)
-    return "R2OK " + h + " rc=" + str(r.returncode)
-if __name__ == "__main__":
-    import os
-    SUFFIX = os.environ["SFX"]
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("r2-launch").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(16), 16).map(lambda _: launch()).collect())):
-        print("R2LAUNCH:", x, flush=True)
-    sp.stop()
-'''
-open("/tmp/r2.sh", "w").write(FR); open("/tmp/job_r2.py", "w").write(JOB)
-import os
-env = dict(os.environ, SFX="%04x" % random.randrange(65536))
-p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
-   "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_r2.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
-for line in p.stdout:
-    if line.startswith("R2LAUNCH:"): print(line.rstrip()[:120], flush=True)
-done[0] = True
-p.wait(); print("watch LISTENER cell for R2_DONE x2", flush=True)
-```
-
-## Step 11 - Delete everything (TERMINAL - do this, it is real money)
-
-```bash
-wb resource delete --id=ssd-raid0 --quiet
-wb resource list | grep ssd     # must print nothing
-```
-
-Deleting also prints nothing for 10-20 minutes, then it is gone. If you leave the cluster
-"just for tonight" it bills roughly $4/hour.
-
-## Diagnostic step: why did a launch fail? (stripdiag)
-
-If a step's containers show `Exited (255)` or logs say `MISSING`, run the cell below
-(or set the loader to `CELL = "stripdiag"`). It runs the SAME privileged host-escape with
-harmless echo probes on both workers and prints each worker's stripe-container log —
-that output names the actual failure.
-
-```python
-# DIAGNOSTIC: why did the stripe container exit 255 on the workers?
-# Runs the SAME docker escape with echo probes and shows container logs.
-import subprocess, threading, time
-JOB = '''
-import socket, subprocess
-def sh(c):
-    r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=120)
-    return ((r.stdout or "") + (r.stderr or ""))[-900:]
-def ensure_img():
-    subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
-                   "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
-                   shell=True, capture_output=True, timeout=600)
-def probe():
-    ensure_img()
-    h = socket.gethostname().split(".")[0]
-    out = ["DIAG " + h]
-    out.append(sh("docker logs strip-" + h + " 2>&1 | tail -20"))
-    out.append(sh("ls -la /tmp/strip* 2>&1 | tail -4"))
-    out.append(sh("docker run --rm --privileged --pid=host --uts=host --network=host "
-                  "--ipc=host -v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr "
-                  "-v /tmp:/tmp -v /dev:/dev hostimg /bin/bash -c "
-                  "'echo INSIDE_OK; /usr/bin/nsenter -t 1 -m -- /bin/echo NSENTER_OK'"))
-    return " ;; ".join(out)
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("stripdiag").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(8), 8).map(lambda _: probe()).collect())):
-        print(x, flush=True)
-    sp.stop()
-'''
-open("/tmp/job_stripdiag.py", "w").write(JOB)
-p = subprocess.Popen(["spark-submit", "--master", "yarn", "--deploy-mode", "client",
-   "--conf", "spark.executor.instances=2", "--conf", "spark.executor.memory=1g",
-   "/tmp/job_stripdiag.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
-for line in p.stdout:
-    log.append(line)
-    if line.startswith("DIAG"): print(line.rstrip(), flush=True)
-done[0] = True
-rc = p.wait()
-print("rc:", rc, flush=True)
-if rc != 0:
-    print("--- job FAILED - last 25 lines ---")
-    print("".join(log[-25:]))
-```
-
-## GPU chapter (optional): the second pipe - RAM into the GPU
-
-The disk tests above never touch the GPU. These three cells check the GPU is visible on
-both workers and measure the host-RAM -> GPU copy speed, the second hop of the pipeline
-`local disk -> RAM -> GPU`. A T4 sits on PCIe Gen3 x16, so expect roughly 8-11 GiB/s -
-faster than the ~6 GiB/s the 16-disk RAID0 can feed it, which is the point: the disk,
-not the GPU road, is the narrow pipe.
-
-Note: this chapter was added 2026-09-29 and its numbers had not been measured in the wild
-yet; the method (same worker channel as the disk tests) is the proven one. Run GPU-1,
-then GPU-2, then GPU-3 after the H2_DONE heartbeats appear in the listener cell.
-
-```python
-# GPU-1: is the GPU visible and healthy on every worker? Output comes back into this
-# cell. If only one worker appears, just re-run (YARN may stack both executors on one
-# worker; a few re-runs reach both).
-import subprocess, threading, time
-JOB = '''
-import socket, subprocess
-def ensure_img():
-    subprocess.run("docker image inspect hostimg >/dev/null 2>&1 || "
-                   "tar -c -C / bin lib lib64 usr 2>/dev/null | docker import - hostimg",
-                   shell=True, capture_output=True, timeout=600)
-def probe():
-    ensure_img()
-    h = socket.gethostname().split(".")[0]
-    cmd = ("docker run --rm --privileged --pid=host --uts=host --network=host --ipc=host "
-           "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev hostimg "
-           "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv'")
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
-    return "GPU " + h + " rc=" + str(r.returncode) + " | " + ((r.stdout or "") + (r.stderr or ""))[-300:]
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("gpu-check").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(4), 4).map(lambda _: probe()).collect())):
-        print("GPUCHECK:", x, flush=True)
-    sp.stop()
-'''
-open("/tmp/job_gpu.py", "w").write(JOB)
-p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
-   "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_gpu.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
-for line in p.stdout:
-    log.append(line)
-    if line.startswith("GPUCHECK:"): print(line.rstrip()[:250], flush=True)
-done[0] = True
-rc = p.wait()
-print("rc:", rc, flush=True)
-if rc != 0:
-    print("--- job FAILED - last 25 lines of its output ---")
-    print("".join(log[-25:]))
-```
-
-```python
-# GPU-2: RAM -> GPU copy speed on both workers: 30 seconds of 150 MiB pinned copies on
-# a T4 (PCIe Gen3). The FIRST run also pip-installs cupy on the workers (can take a few
-# minutes) - that is normal. Heartbeats (H2 ...) land in the step-4 listener cell while
-# it runs; GPU-3 collects the final numbers.
-import subprocess, random, os
-SFX = "%04x" % random.randrange(65536)
-FR = r"""#!/bin/bash
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-H=$(hostname); MGR="${H%%-w-*}-m.$(hostname -d)"
-post() { curl -m5 -s -X POST --data-binary "$1" "http://$MGR:18888/h2-$H" || true; }
-exec 9>/tmp/h2dTOK.lock; flock -n 9 || { post "H2_SKIPLOCK $H"; exit 0; }
-post "H2_INSTALL $H first run pip-installs cupy, can take minutes"
-python3 -m pip install --quiet cupy-cuda12x >/tmp/h2d_pipTOK.log 2>&1 || { post "H2_PIPFAIL $H see /tmp/h2d_pipTOK.log"; exit 0; }
-post "H2_RUN $H 30s pinned-copy loop started"
-python3 /tmp/h2d_progTOK.py $MGR $H >/tmp/h2d_outTOK.log 2>&1
-post "H2_DONE $H rc=$? last: $(tail -1 /tmp/h2d_outTOK.log)"
-""".replace("TOK", SFX)
-PROG = r"""import sys, time, urllib.request
-import cupy as cp
-mgr, h = sys.argv[1], sys.argv[2]
-def post(msg):
-    try:
-        urllib.request.urlopen("http://" + mgr + ":18888/hb-" + h, data=msg.encode(), timeout=5)
-    except Exception:
-        pass
-nb = 150 * 1024 * 1024
-pin = cp.cuda.alloc_pinned_memory(nb)
-host = cp.ndarray(nb // 4, cp.float32, cp.cuda.MemoryPointer(cp.cuda.UnownedMemory(pin.ptr, nb, pin), 0))
-dev = cp.empty(nb // 4, dtype=cp.float32)
-start = time.time(); n = 0
-while time.time() - start < 30:
-    dev[...] = host
-    n += 1
-    if n % 10 == 0:
-        gib = n * 150 / 1024
-        post("H2 %s %.1fs %.2f GiB ~%.2f GiB/s" % (h, time.time() - start, gib, gib / (time.time() - start)))
-"""
-open("/tmp/h2d_prog" + SFX + ".py", "w").write(PROG)
-open("/tmp/h2d" + SFX + ".sh", "w").write(FR)
-JOB = '''
-import socket, subprocess
-FR = open("/tmp/h2dTOK.sh").read()
-PG = open("/tmp/h2d_progTOK.py").read()
-def launch():
-    h = socket.gethostname().split(".")[0]
-    open("/tmp/h2dTOK.sh", "w").write(FR)
-    open("/tmp/h2d_progTOK.py", "w").write(PG)
-    r = subprocess.run("docker run -d --name h2-TOK-" + h + " --privileged --pid=host --uts=host --network=host --ipc=host "
-                       "-v /:/host -v /lib64:/lib64 -v /lib:/lib -v /usr:/usr -v /tmp:/tmp -v /dev:/dev hostimg "
-                       "/bin/bash -c '/usr/bin/nsenter -t 1 -m -- /bin/bash /tmp/h2dTOK.sh'",
-                       shell=True, capture_output=True, text=True)
-    return "H2START " + h + " rc=" + str(r.returncode)
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("h2d-launch").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(16), 16).map(lambda _: launch()).collect())):
-        print("H2LAUNCH:", x, flush=True)
-    sp.stop()
-'''.replace("TOK", SFX)
-open("/tmp/job_h2d.py", "w").write(JOB)
-p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
-   "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_h2d.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-log = []
-done = [False]
-def beat():
-    t0 = time.time()
-    while not done[0]:
-        time.sleep(10)
-        print("HB %.0fs log=%d last=%s" % (time.time() - t0, len(log), (log[-1].strip()[:80] if log else "")), flush=True)
-threading.Thread(target=beat, daemon=True).start()
-for line in p.stdout:
-    log.append(line)
-    if line.startswith("H2LAUNCH:"): print(line.rstrip()[:160], flush=True)
-done[0] = True
-rc = p.wait()
-print("rc:", rc, " SFX:", SFX, flush=True)
-if rc != 0:
-    print("--- job FAILED - last 25 lines of its output ---")
-    print("".join(log[-25:]))
-```
-
-```python
-# GPU-3: collect the RAM -> GPU results from both workers (uses SFX set by GPU-2, so
-# run AFTER GPU-2 in the same kernel). Wait until you have seen
-# H2_DONE for both workers in the listener cell (first run: after the pip install).
-# Expect ~8-11 GiB/s per worker on a T4. Re-run this cell if a worker says "no result yet".
-import subprocess
-JOB = '''
-import socket, subprocess
-def probe():
-    h = socket.gethostname().split(".")[0]
-    f = "/tmp/h2d_outTOK.log"
-    r = subprocess.run("tail -3 " + f + " 2>/dev/null || echo NOFILE", shell=True, capture_output=True, text=True)
-    return "H2 " + h + " | " + r.stdout.replace(chr(10), " ;; ")
-if __name__ == "__main__":
-    from pyspark.sql import SparkSession
-    sp = SparkSession.builder.appName("h2d-fetch").getOrCreate()
-    for x in sorted(set(sp.sparkContext.parallelize(range(8), 8).map(lambda _: probe()).collect())):
-        print("H2FETCH:", x, flush=True)
-    sp.stop()
-'''.replace("TOK", SFX)
-open("/tmp/job_h2d_fetch.py", "w").write(JOB)
-p = subprocess.Popen(["spark-submit","--master","yarn","--deploy-mode","client",
-   "--conf","spark.executor.instances=2","--conf","spark.executor.memory=1g","/tmp/job_h2d_fetch.py"],
-   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-log = []
-for line in p.stdout:
-    log.append(line)
-    if line.startswith("H2FETCH:"): print(line.rstrip()[:250], flush=True)
-rc = p.wait()
-print("rc:", rc, flush=True)
-if rc != 0:
-    print("--- job FAILED - last 25 lines of its output ---")
-    print("".join(log[-25:]))
-```
-
-## What the numbers mean for a GPU streaming design
-
-- One worker with 16 local SSDs gives ~6 GiB/s of steady raw reads when the reader keeps
-  many requests in flight. A single slow reader sees only ~1.2-3.5 GiB/s - same disks,
-  same machine, only the queue depth differs.
-- Network (only for getting data onto the machine): N1 with 1 GPU = min(2 Gbps x vCPUs,
-  32 Gbps) = up to 3.7 GiB/s, already maxed at 16 vCPUs
-  (https://cloud.google.com/compute/docs/gpus/gpu-network-bandwidth). More CPUs do not
-  change the local-disk numbers at all.
-- The GPU slot is not the limit: a T4's PCIe slot passes ~11 GiB/s from RAM to GPU,
-  comfortably above the 6 GiB/s the disks can feed it.
-- The 16-disk trick only works on the plain CPU workers and on N1+GPU machines (N1 with
-  T4/V100 accepts 16+ local SSDs). The L4 "G2" machines accept at most 8 local SSDs
-  (~2.5 GiB/s), and A100 "A2" also stop at 8. If you need GPU + big local IO on one
-  box, N1+T4 is the only cheap combination that can attach 16-24 local SSDs.
-- NVMe interface would raise the per-disk-count caps further, but Terra's Workspace
-  Manager currently drops the `localSsdInterface` argument (one missing line upstream,
-  we filed it). Until that is fixed, everything here is the SCSI path.
-- Price: this whole recipe (2 workers + 16 local SSDs each) is about $4/hour, which would be
-  an equivalent of $2/h per worker/experiment.
-  24 disks per worker (9,360 MiB/s row) instead of 16 barely changes the bill.
-  Speed caps: https://docs.cloud.google.com/compute/docs/disks/local-ssd#ssd-perf-disk-count
-
