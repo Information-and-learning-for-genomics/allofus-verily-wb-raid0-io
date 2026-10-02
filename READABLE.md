@@ -147,6 +147,26 @@ else:
 # all six fit on one 32-core worker -> single-host session, t4-io5 2026-10-02 20:26.)
 # Works whether the tenant gives n1-standard-32 or the templated n1-standard-8 (uses RM truth).
 import os, sys, glob, socket, json, subprocess
+
+def __silence_spark(sc):
+    # Kernel-side Spark spam fix (2026-10-02): sc.setLogLevel("ERROR") does NOT stick on this
+    # Dataproc Spark 3.5 (WARN waterfalls from C5's NM restarts still reached the notebook).
+    # Set log4j2 core directly through py4j: root=ERROR, and OFF for the loggers that ONLY ever
+    # emit expected corpse-handling noise when C5 stops the NodeManager. Real failures still
+    # surface: cells print explicit verdicts, worker truth arrives via the sink.
+    try:
+        jvm = sc._jvm
+        cfg = jvm.org.apache.logging.log4j.core.config.Configurator
+        lv = jvm.org.apache.logging.log4j.Level
+        cfg.setRootLevel(lv.ERROR)
+        for name in ("org.apache.spark.scheduler.cluster",
+                     "org.apache.spark.storage.BlockManagerMasterEndpoint",
+                     "org.apache.spark.network",
+                     "org.apache.spark.MapOutputTrackerMasterEndpoint"):
+            cfg.setLevel(name, lv.OFF)
+        print("spark kernel logs silenced (root=ERROR; lost-node chatters=OFF)", flush=True)
+    except Exception as e:
+        print("WARN: spark log silencing failed:", repr(e)[:120], flush=True)
 def __session_hosts(s):
     return sorted(set(s.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
 def __node_shape():
@@ -169,6 +189,7 @@ if __alive and len(__session_hosts(__sc)) >= 2:
     if "spark" not in globals():
         globals()["spark"] = __sc.sparkSession
     print("SESSION OK reused", flush=True)
+    __silence_spark(__sc)
     hosts = __session_hosts(__sc)
 else:
     if __alive:
@@ -200,6 +221,7 @@ else:
     spark = b.getOrCreate()
     sc = spark.sparkContext
     sc.setLogLevel("ERROR")
+    __silence_spark(sc)
     globals()["spark"] = spark
     globals()["sc"] = sc
     print("SESSION OK new applicationId=", sc.applicationId, flush=True)
@@ -325,6 +347,18 @@ else:
             __sc = spark.sparkContext
             __sc.setLogLevel("ERROR")
             globals()["spark"] = spark
+            try:
+                _cfg = __sc._jvm.org.apache.logging.log4j.core.config.Configurator
+                _lv = __sc._jvm.org.apache.logging.log4j.Level
+                _cfg.setRootLevel(_lv.ERROR)
+                for _nm in ("org.apache.spark.scheduler.cluster",
+                            "org.apache.spark.storage.BlockManagerMasterEndpoint",
+                            "org.apache.spark.network",
+                            "org.apache.spark.MapOutputTrackerMasterEndpoint"):
+                    _cfg.setLevel(_nm, _lv.OFF)
+                print("spark kernel logs silenced (root=ERROR; lost-node chatters=OFF)", flush=True)
+            except Exception:
+                pass
             globals()["sc"] = __sc
             _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
             print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
@@ -468,6 +502,18 @@ else:
             __sc = spark.sparkContext
             __sc.setLogLevel("ERROR")
             globals()["spark"] = spark
+            try:
+                _cfg = __sc._jvm.org.apache.logging.log4j.core.config.Configurator
+                _lv = __sc._jvm.org.apache.logging.log4j.Level
+                _cfg.setRootLevel(_lv.ERROR)
+                for _nm in ("org.apache.spark.scheduler.cluster",
+                            "org.apache.spark.storage.BlockManagerMasterEndpoint",
+                            "org.apache.spark.network",
+                            "org.apache.spark.MapOutputTrackerMasterEndpoint"):
+                    _cfg.setLevel(_nm, _lv.OFF)
+                print("spark kernel logs silenced (root=ERROR; lost-node chatters=OFF)", flush=True)
+            except Exception:
+                pass
             globals()["sc"] = __sc
             _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
             print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
@@ -611,6 +657,18 @@ else:
             __sc = spark.sparkContext
             __sc.setLogLevel("ERROR")
             globals()["spark"] = spark
+            try:
+                _cfg = __sc._jvm.org.apache.logging.log4j.core.config.Configurator
+                _lv = __sc._jvm.org.apache.logging.log4j.Level
+                _cfg.setRootLevel(_lv.ERROR)
+                for _nm in ("org.apache.spark.scheduler.cluster",
+                            "org.apache.spark.storage.BlockManagerMasterEndpoint",
+                            "org.apache.spark.network",
+                            "org.apache.spark.MapOutputTrackerMasterEndpoint"):
+                    _cfg.setLevel(_nm, _lv.OFF)
+                print("spark kernel logs silenced (root=ERROR; lost-node chatters=OFF)", flush=True)
+            except Exception:
+                pass
             globals()["sc"] = __sc
             _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
             print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
@@ -754,6 +812,18 @@ else:
             __sc = spark.sparkContext
             __sc.setLogLevel("ERROR")
             globals()["spark"] = spark
+            try:
+                _cfg = __sc._jvm.org.apache.logging.log4j.core.config.Configurator
+                _lv = __sc._jvm.org.apache.logging.log4j.Level
+                _cfg.setRootLevel(_lv.ERROR)
+                for _nm in ("org.apache.spark.scheduler.cluster",
+                            "org.apache.spark.storage.BlockManagerMasterEndpoint",
+                            "org.apache.spark.network",
+                            "org.apache.spark.MapOutputTrackerMasterEndpoint"):
+                    _cfg.setLevel(_nm, _lv.OFF)
+                print("spark kernel logs silenced (root=ERROR; lost-node chatters=OFF)", flush=True)
+            except Exception:
+                pass
             globals()["sc"] = __sc
             _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
             print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
@@ -897,6 +967,18 @@ else:
             __sc = spark.sparkContext
             __sc.setLogLevel("ERROR")
             globals()["spark"] = spark
+            try:
+                _cfg = __sc._jvm.org.apache.logging.log4j.core.config.Configurator
+                _lv = __sc._jvm.org.apache.logging.log4j.Level
+                _cfg.setRootLevel(_lv.ERROR)
+                for _nm in ("org.apache.spark.scheduler.cluster",
+                            "org.apache.spark.storage.BlockManagerMasterEndpoint",
+                            "org.apache.spark.network",
+                            "org.apache.spark.MapOutputTrackerMasterEndpoint"):
+                    _cfg.setLevel(_nm, _lv.OFF)
+                print("spark kernel logs silenced (root=ERROR; lost-node chatters=OFF)", flush=True)
+            except Exception:
+                pass
             globals()["sc"] = __sc
             _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
             print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
