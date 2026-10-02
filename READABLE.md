@@ -6,7 +6,9 @@ VERIFIED FACT on this tenant: GPU Dataproc workers may be silently templated to 
 8 SSD + T4 ($1.07/h console-metered on t4-io3) — C4 probe is the only truth source.
 When the order DOES land as asked (proven on t4-io5 2026-10-02: n1-standard-32, 16 data
 SSDs, T4 on PCI, both workers): $3.83/h console-metered incl. master. Local SSD capacity is
-INCLUDED in the N1 machine price — never add per-GiB SSD charges on top in estimates.
+NOT separately visible at this price: raw list WITH the per-GiB SSD line is $5.09-5.82/h
+(DERIVED); console bills $3.83 => tenant contract discount. NEVER derive quotes from raw list — quote
+only console-metered numbers.
 proxyUri per cluster via
 `wb resource describe --id=<cluster> --format=JSON`).
 Question: does the cheap box reproduce the per-box 6.1–6.7 GiB/s 16-disk row WITH the GPU in the path?

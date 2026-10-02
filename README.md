@@ -54,8 +54,9 @@ notebook cell); markers must arrive from BOTH workers.
 
 - Ordered shape 2× [n1-standard-32 + 16×375 GiB local SSDs + 1× T4]: **$3.83/h**
   (console-metered, 2026-10-02, cluster t4-io5, both workers + master included).
-  Note: local SSD capacity is INCLUDED in the N1 machine price — do not add per-GiB SSD
-  charges on top when estimating; that double-count inflated earlier written estimates.
+  Note on pricing mechanics: GCP docs DO bill local SSD per provisioned GiB separately, so raw
+  list with the SSD line is $5.09-5.82/h (derived) — the console's $3.83/h reflects contracted
+  tenant pricing. Quote only console-metered values; raw-list arithmetic misleads here.
 - Verified fact on this tenant: GPU Dataproc workers may be **silently templated** down to
   n1-standard-8 + 8 SSDs + T4 — **$1.07/h** (console-metered, cluster t4-io3) — a different
   machine than you ordered (8 SSDs cannot reach the 16-disk speed cap).
