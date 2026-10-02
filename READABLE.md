@@ -213,8 +213,8 @@ if len(hosts) < 2:
 ```python
 # === io_t4 paste cell: 00_RESET.sh (emptyimg+loader-mount docker-root channel; sink tag T4R) ===
 # Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
-# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
-# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# No live session -> "MODE: spark-submit fallback" (1-3 min). Session STALE across the C5 disk wipe
+# is auto-detected (90s bounded probe) and REBUILT in-place ("SESSION rebuilt"); refuses unless the sink
 # answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then QFRESH_PASS from BOTH workers in the SINK cell.
 # Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
 import subprocess, random, os, socket, time, base64
@@ -266,10 +266,71 @@ else:
     __sc = globals().get("sc")
     __live = False
     if __sc is not None:
+        # TIME-BOUNDED probe (2026-10-02 fix): C5 mkfs wipes the filesystem that HELD THIS APP'S
+        # HDFS staging files -> new containers can never localize (BlockMissingException loop, NO
+        # exception reaches the driver, unbounded count() hangs forever). Unhealthy session is
+        # stopped and REBUILT right here: post-wipe HDFS is healthy-but-empty, so a NEW app
+        # stages fine. Self-heal inside the cell; nothing needs to be redone by hand.
+        import threading
+        box = []
+        def __probe():
+            try:
+                __sc.parallelize([1], 1).count()
+                box.append("ok")
+            except Exception:
+                box.append("err")
+        th = threading.Thread(target=__probe)
+        th.daemon = True
+        th.start()
+        th.join(90)
+        __live = (box == ["ok"])
+        if not __live:
+            print("session unhealthy (stale across C5 disk wipe?) -> stopping + rebuilding", flush=True)
+            def __stop():
+                try:
+                    __sc.stop()
+                except Exception:
+                    pass
+            ts = threading.Thread(target=__stop)
+            ts.daemon = True
+            ts.start()
+            ts.join(45)
+            globals()["sc"] = None
+            globals()["spark"] = None
+            __sc = None
+    if not __live and "pyspark" in getattr(__import__("sys"), "modules", {}):
+        # C2 ran in THIS kernel before (its sys.path bootstrap is present) -> rebuild the session
+        # with the same forced-spread sizing as C2.
         try:
-            __live = (__sc.parallelize([1], 1).count() == 1)
-        except Exception:
-            __live = False
+            import json as _json
+            from pyspark.sql import SparkSession as __SS
+            _avail = 0
+            try:
+                _r = subprocess.run(["sudo", "curl", "-s", "-m10", "http://localhost:8088/ws/v1/cluster/nodes"],
+                                    capture_output=True, text=True, timeout=30)
+                _nodes = (_json.loads(_r.stdout).get("nodes") or {}).get("node") or []
+                _cs = [n.get("availableVCores", 0) for n in _nodes if n.get("state") == "RUNNING"]
+                _avail = min(_cs) if _cs else 0
+            except Exception:
+                pass
+            _ec = max(1, _avail // 2) if _avail else 1
+            _b = (__SS.builder.appName("io_t4-session")
+                  .config("spark.executor.cores", str(_ec))
+                  .config("spark.executor.memory", "4g")
+                  .config("spark.executor.memoryOverhead", "1g")
+                  .config("spark.excludeOnFailure.enabled", "false")
+                  .config("spark.executor.maxNumFailures", "1000")
+                  .config("spark.executor.instances", "4" if _avail else "6"))
+            spark = _b.getOrCreate()
+            __sc = spark.sparkContext
+            __sc.setLogLevel("ERROR")
+            globals()["spark"] = spark
+            globals()["sc"] = __sc
+            _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
+            print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
+            __live = len(_hosts) >= 2
+        except Exception as e:
+            print("session rebuild failed:", repr(e)[:200], "-> falling back", flush=True)
     if __live:
         print("MODE: session", flush=True)
         for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
@@ -295,8 +356,8 @@ else:
 ```python
 # === io_t4 paste cell: 03_PROBE_GPU.sh (emptyimg+loader-mount docker-root channel; sink tag T4P) ===
 # Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
-# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
-# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# No live session -> "MODE: spark-submit fallback" (1-3 min). Session STALE across the C5 disk wipe
+# is auto-detected (90s bounded probe) and REBUILT in-place ("SESSION rebuilt"); refuses unless the sink
 # answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then T4PROBE_DONE from BOTH workers in the SINK cell.
 # Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
 import subprocess, random, os, socket, time, base64
@@ -348,10 +409,71 @@ else:
     __sc = globals().get("sc")
     __live = False
     if __sc is not None:
+        # TIME-BOUNDED probe (2026-10-02 fix): C5 mkfs wipes the filesystem that HELD THIS APP'S
+        # HDFS staging files -> new containers can never localize (BlockMissingException loop, NO
+        # exception reaches the driver, unbounded count() hangs forever). Unhealthy session is
+        # stopped and REBUILT right here: post-wipe HDFS is healthy-but-empty, so a NEW app
+        # stages fine. Self-heal inside the cell; nothing needs to be redone by hand.
+        import threading
+        box = []
+        def __probe():
+            try:
+                __sc.parallelize([1], 1).count()
+                box.append("ok")
+            except Exception:
+                box.append("err")
+        th = threading.Thread(target=__probe)
+        th.daemon = True
+        th.start()
+        th.join(90)
+        __live = (box == ["ok"])
+        if not __live:
+            print("session unhealthy (stale across C5 disk wipe?) -> stopping + rebuilding", flush=True)
+            def __stop():
+                try:
+                    __sc.stop()
+                except Exception:
+                    pass
+            ts = threading.Thread(target=__stop)
+            ts.daemon = True
+            ts.start()
+            ts.join(45)
+            globals()["sc"] = None
+            globals()["spark"] = None
+            __sc = None
+    if not __live and "pyspark" in getattr(__import__("sys"), "modules", {}):
+        # C2 ran in THIS kernel before (its sys.path bootstrap is present) -> rebuild the session
+        # with the same forced-spread sizing as C2.
         try:
-            __live = (__sc.parallelize([1], 1).count() == 1)
-        except Exception:
-            __live = False
+            import json as _json
+            from pyspark.sql import SparkSession as __SS
+            _avail = 0
+            try:
+                _r = subprocess.run(["sudo", "curl", "-s", "-m10", "http://localhost:8088/ws/v1/cluster/nodes"],
+                                    capture_output=True, text=True, timeout=30)
+                _nodes = (_json.loads(_r.stdout).get("nodes") or {}).get("node") or []
+                _cs = [n.get("availableVCores", 0) for n in _nodes if n.get("state") == "RUNNING"]
+                _avail = min(_cs) if _cs else 0
+            except Exception:
+                pass
+            _ec = max(1, _avail // 2) if _avail else 1
+            _b = (__SS.builder.appName("io_t4-session")
+                  .config("spark.executor.cores", str(_ec))
+                  .config("spark.executor.memory", "4g")
+                  .config("spark.executor.memoryOverhead", "1g")
+                  .config("spark.excludeOnFailure.enabled", "false")
+                  .config("spark.executor.maxNumFailures", "1000")
+                  .config("spark.executor.instances", "4" if _avail else "6"))
+            spark = _b.getOrCreate()
+            __sc = spark.sparkContext
+            __sc.setLogLevel("ERROR")
+            globals()["spark"] = spark
+            globals()["sc"] = __sc
+            _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
+            print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
+            __live = len(_hosts) >= 2
+        except Exception as e:
+            print("session rebuild failed:", repr(e)[:200], "-> falling back", flush=True)
     if __live:
         print("MODE: session", flush=True)
         for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
@@ -377,8 +499,8 @@ else:
 ```python
 # === io_t4 paste cell: 00_ROOT_SETUP.sh (emptyimg+loader-mount docker-root channel; sink tag T4S) ===
 # Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
-# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
-# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# No live session -> "MODE: spark-submit fallback" (1-3 min). Session STALE across the C5 disk wipe
+# is auto-detected (90s bounded probe) and REBUILT in-place ("SESSION rebuilt"); refuses unless the sink
 # answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then T4SETUP_DONE from BOTH workers in the SINK cell.
 # Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
 import subprocess, random, os, socket, time, base64
@@ -430,10 +552,71 @@ else:
     __sc = globals().get("sc")
     __live = False
     if __sc is not None:
+        # TIME-BOUNDED probe (2026-10-02 fix): C5 mkfs wipes the filesystem that HELD THIS APP'S
+        # HDFS staging files -> new containers can never localize (BlockMissingException loop, NO
+        # exception reaches the driver, unbounded count() hangs forever). Unhealthy session is
+        # stopped and REBUILT right here: post-wipe HDFS is healthy-but-empty, so a NEW app
+        # stages fine. Self-heal inside the cell; nothing needs to be redone by hand.
+        import threading
+        box = []
+        def __probe():
+            try:
+                __sc.parallelize([1], 1).count()
+                box.append("ok")
+            except Exception:
+                box.append("err")
+        th = threading.Thread(target=__probe)
+        th.daemon = True
+        th.start()
+        th.join(90)
+        __live = (box == ["ok"])
+        if not __live:
+            print("session unhealthy (stale across C5 disk wipe?) -> stopping + rebuilding", flush=True)
+            def __stop():
+                try:
+                    __sc.stop()
+                except Exception:
+                    pass
+            ts = threading.Thread(target=__stop)
+            ts.daemon = True
+            ts.start()
+            ts.join(45)
+            globals()["sc"] = None
+            globals()["spark"] = None
+            __sc = None
+    if not __live and "pyspark" in getattr(__import__("sys"), "modules", {}):
+        # C2 ran in THIS kernel before (its sys.path bootstrap is present) -> rebuild the session
+        # with the same forced-spread sizing as C2.
         try:
-            __live = (__sc.parallelize([1], 1).count() == 1)
-        except Exception:
-            __live = False
+            import json as _json
+            from pyspark.sql import SparkSession as __SS
+            _avail = 0
+            try:
+                _r = subprocess.run(["sudo", "curl", "-s", "-m10", "http://localhost:8088/ws/v1/cluster/nodes"],
+                                    capture_output=True, text=True, timeout=30)
+                _nodes = (_json.loads(_r.stdout).get("nodes") or {}).get("node") or []
+                _cs = [n.get("availableVCores", 0) for n in _nodes if n.get("state") == "RUNNING"]
+                _avail = min(_cs) if _cs else 0
+            except Exception:
+                pass
+            _ec = max(1, _avail // 2) if _avail else 1
+            _b = (__SS.builder.appName("io_t4-session")
+                  .config("spark.executor.cores", str(_ec))
+                  .config("spark.executor.memory", "4g")
+                  .config("spark.executor.memoryOverhead", "1g")
+                  .config("spark.excludeOnFailure.enabled", "false")
+                  .config("spark.executor.maxNumFailures", "1000")
+                  .config("spark.executor.instances", "4" if _avail else "6"))
+            spark = _b.getOrCreate()
+            __sc = spark.sparkContext
+            __sc.setLogLevel("ERROR")
+            globals()["spark"] = spark
+            globals()["sc"] = __sc
+            _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
+            print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
+            __live = len(_hosts) >= 2
+        except Exception as e:
+            print("session rebuild failed:", repr(e)[:200], "-> falling back", flush=True)
     if __live:
         print("MODE: session", flush=True)
         for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
@@ -459,8 +642,8 @@ else:
 ```python
 # === io_t4 paste cell: 01_FILL.sh (emptyimg+loader-mount docker-root channel; sink tag T4F) ===
 # Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
-# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
-# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# No live session -> "MODE: spark-submit fallback" (1-3 min). Session STALE across the C5 disk wipe
+# is auto-detected (90s bounded probe) and REBUILT in-place ("SESSION rebuilt"); refuses unless the sink
 # answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then FILL_ALLDONE from BOTH workers in the SINK cell.
 # Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
 import subprocess, random, os, socket, time, base64
@@ -512,10 +695,71 @@ else:
     __sc = globals().get("sc")
     __live = False
     if __sc is not None:
+        # TIME-BOUNDED probe (2026-10-02 fix): C5 mkfs wipes the filesystem that HELD THIS APP'S
+        # HDFS staging files -> new containers can never localize (BlockMissingException loop, NO
+        # exception reaches the driver, unbounded count() hangs forever). Unhealthy session is
+        # stopped and REBUILT right here: post-wipe HDFS is healthy-but-empty, so a NEW app
+        # stages fine. Self-heal inside the cell; nothing needs to be redone by hand.
+        import threading
+        box = []
+        def __probe():
+            try:
+                __sc.parallelize([1], 1).count()
+                box.append("ok")
+            except Exception:
+                box.append("err")
+        th = threading.Thread(target=__probe)
+        th.daemon = True
+        th.start()
+        th.join(90)
+        __live = (box == ["ok"])
+        if not __live:
+            print("session unhealthy (stale across C5 disk wipe?) -> stopping + rebuilding", flush=True)
+            def __stop():
+                try:
+                    __sc.stop()
+                except Exception:
+                    pass
+            ts = threading.Thread(target=__stop)
+            ts.daemon = True
+            ts.start()
+            ts.join(45)
+            globals()["sc"] = None
+            globals()["spark"] = None
+            __sc = None
+    if not __live and "pyspark" in getattr(__import__("sys"), "modules", {}):
+        # C2 ran in THIS kernel before (its sys.path bootstrap is present) -> rebuild the session
+        # with the same forced-spread sizing as C2.
         try:
-            __live = (__sc.parallelize([1], 1).count() == 1)
-        except Exception:
-            __live = False
+            import json as _json
+            from pyspark.sql import SparkSession as __SS
+            _avail = 0
+            try:
+                _r = subprocess.run(["sudo", "curl", "-s", "-m10", "http://localhost:8088/ws/v1/cluster/nodes"],
+                                    capture_output=True, text=True, timeout=30)
+                _nodes = (_json.loads(_r.stdout).get("nodes") or {}).get("node") or []
+                _cs = [n.get("availableVCores", 0) for n in _nodes if n.get("state") == "RUNNING"]
+                _avail = min(_cs) if _cs else 0
+            except Exception:
+                pass
+            _ec = max(1, _avail // 2) if _avail else 1
+            _b = (__SS.builder.appName("io_t4-session")
+                  .config("spark.executor.cores", str(_ec))
+                  .config("spark.executor.memory", "4g")
+                  .config("spark.executor.memoryOverhead", "1g")
+                  .config("spark.excludeOnFailure.enabled", "false")
+                  .config("spark.executor.maxNumFailures", "1000")
+                  .config("spark.executor.instances", "4" if _avail else "6"))
+            spark = _b.getOrCreate()
+            __sc = spark.sparkContext
+            __sc.setLogLevel("ERROR")
+            globals()["spark"] = spark
+            globals()["sc"] = __sc
+            _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
+            print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
+            __live = len(_hosts) >= 2
+        except Exception as e:
+            print("session rebuild failed:", repr(e)[:200], "-> falling back", flush=True)
     if __live:
         print("MODE: session", flush=True)
         for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
@@ -541,8 +785,8 @@ else:
 ```python
 # === io_t4 paste cell: 02_bench_storage_to_gpu.py (emptyimg+loader-mount docker-root channel; sink tag T4B) ===
 # Dual mode: live C2 session in THIS kernel -> "MODE: session" in-kernel launch (2-5s).
-# No live session -> "MODE: spark-submit fallback" (1-3 min; if this happens AFTER C2 the
-# freshness contract is broken -> restart kernel, run file from C0). Self-checking: refuses unless the sink
+# No live session -> "MODE: spark-submit fallback" (1-3 min). Session STALE across the C5 disk wipe
+# is auto-detected (90s bounded probe) and REBUILT in-place ("SESSION rebuilt"); refuses unless the sink
 # answers. GREEN: PREFLIGHT_OK, two LAUNCHOK hosts, then T4BENCH_DONE from BOTH workers in the SINK cell.
 # Benign: rc=125 "name in use" (dup task on same executor; FR flock dedupes). One host after C2 (which self-heals) -> restart kernel, run from C0.
 import subprocess, random, os, socket, time, base64
@@ -594,10 +838,71 @@ else:
     __sc = globals().get("sc")
     __live = False
     if __sc is not None:
+        # TIME-BOUNDED probe (2026-10-02 fix): C5 mkfs wipes the filesystem that HELD THIS APP'S
+        # HDFS staging files -> new containers can never localize (BlockMissingException loop, NO
+        # exception reaches the driver, unbounded count() hangs forever). Unhealthy session is
+        # stopped and REBUILT right here: post-wipe HDFS is healthy-but-empty, so a NEW app
+        # stages fine. Self-heal inside the cell; nothing needs to be redone by hand.
+        import threading
+        box = []
+        def __probe():
+            try:
+                __sc.parallelize([1], 1).count()
+                box.append("ok")
+            except Exception:
+                box.append("err")
+        th = threading.Thread(target=__probe)
+        th.daemon = True
+        th.start()
+        th.join(90)
+        __live = (box == ["ok"])
+        if not __live:
+            print("session unhealthy (stale across C5 disk wipe?) -> stopping + rebuilding", flush=True)
+            def __stop():
+                try:
+                    __sc.stop()
+                except Exception:
+                    pass
+            ts = threading.Thread(target=__stop)
+            ts.daemon = True
+            ts.start()
+            ts.join(45)
+            globals()["sc"] = None
+            globals()["spark"] = None
+            __sc = None
+    if not __live and "pyspark" in getattr(__import__("sys"), "modules", {}):
+        # C2 ran in THIS kernel before (its sys.path bootstrap is present) -> rebuild the session
+        # with the same forced-spread sizing as C2.
         try:
-            __live = (__sc.parallelize([1], 1).count() == 1)
-        except Exception:
-            __live = False
+            import json as _json
+            from pyspark.sql import SparkSession as __SS
+            _avail = 0
+            try:
+                _r = subprocess.run(["sudo", "curl", "-s", "-m10", "http://localhost:8088/ws/v1/cluster/nodes"],
+                                    capture_output=True, text=True, timeout=30)
+                _nodes = (_json.loads(_r.stdout).get("nodes") or {}).get("node") or []
+                _cs = [n.get("availableVCores", 0) for n in _nodes if n.get("state") == "RUNNING"]
+                _avail = min(_cs) if _cs else 0
+            except Exception:
+                pass
+            _ec = max(1, _avail // 2) if _avail else 1
+            _b = (__SS.builder.appName("io_t4-session")
+                  .config("spark.executor.cores", str(_ec))
+                  .config("spark.executor.memory", "4g")
+                  .config("spark.executor.memoryOverhead", "1g")
+                  .config("spark.excludeOnFailure.enabled", "false")
+                  .config("spark.executor.maxNumFailures", "1000")
+                  .config("spark.executor.instances", "4" if _avail else "6"))
+            spark = _b.getOrCreate()
+            __sc = spark.sparkContext
+            __sc.setLogLevel("ERROR")
+            globals()["spark"] = spark
+            globals()["sc"] = __sc
+            _hosts = sorted(set(__sc.parallelize(range(12), 12).map(lambda _: socket.gethostname().split(".")[0]).collect()))
+            print("SESSION rebuilt applicationId=", __sc.applicationId, "hosts=", _hosts, flush=True)
+            __live = len(_hosts) >= 2
+        except Exception as e:
+            print("session rebuild failed:", repr(e)[:200], "-> falling back", flush=True)
     if __live:
         print("MODE: session", flush=True)
         for x in sorted(set(__sc.parallelize(range(12), 12).map(lambda _: __t4_launch()).collect())):
