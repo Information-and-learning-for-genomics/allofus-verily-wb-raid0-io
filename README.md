@@ -52,10 +52,13 @@ notebook cell); markers must arrive from BOTH workers.
 
 ## 4. Cost honesty
 
-- Ordered shape 2× [n1-standard-32 + 16×375 GiB local SSDs + 1× T4] ≈ **$5.5/h IF it lands**.
+- Ordered shape 2× [n1-standard-32 + 16×375 GiB local SSDs + 1× T4]: **$3.83/h**
+  (console-metered, 2026-10-02, cluster t4-io5, both workers + master included).
+  Note: local SSD capacity is INCLUDED in the N1 machine price — do not add per-GiB SSD
+  charges on top when estimating; that double-count inflated earlier written estimates.
 - Verified fact on this tenant: GPU Dataproc workers may be **silently templated** down to
-  n1-standard-8 + 8 SSDs + T4 ≈ **$1.07/h actual bill** — a different machine than you
-  ordered (8 SSDs cannot reach the 16-disk speed cap).
+  n1-standard-8 + 8 SSDs + T4 — **$1.07/h** (console-metered, cluster t4-io3) — a different
+  machine than you ordered (8 SSDs cannot reach the 16-disk speed cap).
 - **Truth source: the C4 probe lines `GCE_MT` and `SSD_DATA`.** Interpret every result
   against what C4 actually saw, never against what was ordered.
 - Clusters meter while alive. Delete when done: `wb resource delete --id=<ID> --quiet`.
